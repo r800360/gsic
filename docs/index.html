@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gsic: Gaussian Splat Image Compressor</title>
+<meta name="description" content="Compress images with 2D Gaussian splatting. Great quality at very small file sizes. Free and open source for Windows, macOS and Linux.">
+<link rel="icon" type="image/png" href="icon.png">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #16161a; --muted: #5c5c6b; --line: #e4e4ec;
+    --card: #f7f7fa; --accent: #4c5fd7; --accent-fg: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101014; --fg: #ececf2; --muted: #9a9aab; --line: #26262f;
+      --card: #18181f; --accent: #7c8cf8; --accent-fg: #10101a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 22px; }
+  header { padding: 76px 0 52px; text-align: center; }
+  h1 { font-size: clamp(2.1rem, 6vw, 3.1rem); margin: 0 0 .3em; letter-spacing: -.02em; }
+  .tag { color: var(--muted); font-size: 1.15rem; max-width: 34em; margin: 0 auto; }
+  .cta { margin: 38px 0 10px; }
+  .btn {
+    display: inline-block; background: var(--accent); color: var(--accent-fg);
+    padding: 13px 30px; border-radius: 9px; text-decoration: none; font-weight: 600;
+    font-size: 1.05rem; transition: transform .12s ease, filter .12s ease;
+  }
+  .btn:hover { transform: translateY(-1px); filter: brightness(1.08); }
+  .btn.alt { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+  .sub { color: var(--muted); font-size: .9rem; margin-top: 12px; }
+  section { padding: 44px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 1.35rem; margin: 0 0 .7em; letter-spacing: -.01em; }
+  p { margin: 0 0 1em; }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 11px; padding: 18px 20px; }
+  .card h3 { margin: 0 0 .4em; font-size: 1rem; }
+  .card p { margin: 0; color: var(--muted); font-size: .93rem; }
+  .dl { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .dl a {
+    display: block; text-align: center; padding: 16px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card);
+    text-decoration: none; color: var(--fg);
+  }
+  .dl a:hover { border-color: var(--accent); }
+  .dl strong { display: block; font-size: 1rem; }
+  .dl span { color: var(--muted); font-size: .84rem; }
+  .dl a.pick { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent); }
+  table { width: 100%; border-collapse: collapse; font-size: .93rem; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.n { text-align: right; font-variant-numeric: tabular-nums; }
+  code {
+    background: var(--card); border: 1px solid var(--line); border-radius: 5px;
+    padding: 1px 6px; font-size: .88em;
+  }
+  pre {
+    background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+    padding: 14px 16px; overflow-x: auto; font-size: .88rem;
+  }
+  pre code { background: none; border: 0; padding: 0; }
+  footer { padding: 40px 0 60px; color: var(--muted); font-size: .88rem; text-align: center; border-top: 1px solid var(--line); }
+  a { color: var(--accent); }
+  .note { color: var(--muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <img src="icon.png" alt="" width="88" height="88"
+       style="border-radius:19px;display:block;margin:0 auto 18px">
+  <h1>gsic</h1>
+  <p class="tag">Compress images down to a fraction of their size while keeping them looking good, using 2D Gaussian splatting.</p>
+  <div class="cta">
+    <a class="btn" id="primary" href="#download">Download</a>
+    <a class="btn alt" href="#how">How it works</a>
+  </div>
+  <p class="sub" id="detected">Free and open source. Windows, macOS and Linux.</p>
+</header>
+
+<section class="wrap">
+  <h2>What it does</h2>
+  <p>Most image formats chop a picture into a fixed grid and spend the same effort on every block. gsic does something different. It represents your image as a cloud of soft, coloured ellipses and places more of them where the detail actually is, so smooth areas cost almost nothing and edges stay sharp.</p>
+  <div class="grid">
+    <div class="card"><h3>Very small files</h3><p>Around 1% of the size of an uncompressed image, and it beats JPEG by about 3 dB on illustration and artwork at the same file size.</p></div>
+    <div class="card"><h3>Fast</h3><p>Roughly three times faster than the reference research implementation, while running on far cheaper hardware.</p></div>
+    <div class="card"><h3>Works everywhere</h3><p>Uses your graphics card when it can and every CPU core when it cannot. No special hardware required.</p></div>
+    <div class="card"><h3>Batch friendly</h3><p>Drag in a whole folder of images and get a compressed copy of each one, with a live preview as it works.</p></div>
+  </div>
+</section>
+
+<section class="wrap" id="download">
+  <h2>Download</h2>
+  <div class="dl">
+    <a id="dl-win" href="#"><strong>Windows</strong><span>64-bit</span></a>
+    <a id="dl-mac" href="#"><strong>macOS</strong><span>Apple Silicon</span></a>
+    <a id="dl-linux" href="#"><strong>Linux</strong><span>64-bit</span></a>
+  </div>
+  <p class="note" style="margin-top:16px">Unpack the archive and run <code>gsic-gui</code> for the desktop app, or <code>gsic</code> for the command line. Nothing needs installing. Every download ships with a SHA-256 checksum so you can verify it.</p>
+  <!-- <p class="note">On Windows you can also get gsic from the Microsoft Store, which keeps it updated automatically.</p> -->
+
+  <h3 style="font-size:1rem;margin:26px 0 8px">Older computers</h3>
+  <p class="note" style="margin-bottom:12px">If your machine is more than a decade old, one of these will be the right build. They are the same program with the same features.</p>
+  <div class="dl">
+    <a id="dl-win32" href="#"><strong>Windows 32-bit</strong><span>for 32-bit Windows installs</span></a>
+    <a id="dl-macx64" href="#"><strong>macOS Intel</strong><span>for pre-2020 Macs</span></a>
+  </div>
+  <p class="note" style="margin-top:12px">The 32-bit build handles images up to 16 megapixels, roughly 4000 by 4000. That is a limit of 32-bit Windows itself, which does not give a program enough memory to work on anything larger. Files made by either build open in the other.</p>
+  <p class="note">Not sure which you have? On Windows, open Settings, then System, then About, and look at "System type". If it says 64-bit, use the standard download above.</p>
+</section>
+
+<section class="wrap" id="how">
+  <h2>How it works</h2>
+  <p>Your image is rebuilt as a sum of thousands of coloured 2D Gaussians. Each one has a position, a size, a rotation and a colour. Compressing an image means running an optimizer that nudges those numbers until the reconstruction matches the original, then storing only the numbers. Because the result is a set of shapes rather than a grid of pixels, it can be decoded at any resolution you like.</p>
+  <pre><code>gsic compress photo.png              # make photo.gsi
+gsic compress *.png --preset high    # a whole folder, best quality
+gsic decompress photo.gsi            # back to PNG
+gsic decompress photo.gsi --scale 2  # decode at twice the size</code></pre>
+</section>
+
+<section class="wrap">
+  <h2>Results</h2>
+  <p>Measured against the published figures of the Image-GS research paper, on a laptop GPU rather than the workstation card used in the paper.</p>
+  <table>
+    <thead><tr><th>2048 x 2048, 1000 steps</th><th class="n">Image-GS (A6000)</th><th class="n">gsic (RTX 4050 laptop)</th></tr></thead>
+    <tbody>
+      <tr><td>10K Gaussians</td><td class="n">18.74 s</td><td class="n">6.38 s</td></tr>
+      <tr><td>50K Gaussians</td><td class="n">26.32 s</td><td class="n">7.90 s</td></tr>
+      <tr><td>Quality across 45 test images</td><td class="n">32.99 dB at 0.366 bpp</td><td class="n">33.34 dB at 0.340 bpp</td></tr>
+    </tbody>
+  </table>
+  <p class="note" style="margin-top:14px">Higher dB is better and lower bpp means a smaller file, so gsic is ahead on both at once. Full detail is in the <a id="report-link" href="#">technical report</a>.</p>
+</section>
+
+<footer class="wrap">
+  <p>MIT licensed. Built on the Image-GS method by Zhang and colleagues.<br>
+  <a id="repo-link" href="#">Source code</a> &middot; <a id="issues-link" href="#">Report a problem</a></p>
+</footer>
+
+<script>
+  const REPO = "https://github.com/r800360/gsic";
+  const LATEST = REPO + "/releases/latest/download/";
+
+  const files = {
+    win:    "gsic-windows-x64.zip",
+    mac:    "gsic-macos-arm64.tar.gz",
+    linux:  "gsic-linux-x64.tar.gz",
+    win32:  "gsic-windows-x86.zip",
+    macx64: "gsic-macos-x64.tar.gz",
+  };
+  for (const [key, file] of Object.entries(files)) {
+    document.getElementById("dl-" + key).href = LATEST + file;
+  }
+  document.getElementById("repo-link").href   = REPO;
+  document.getElementById("issues-link").href = REPO + "/issues";
+  document.getElementById("report-link").href = REPO + "/releases/latest/download/report.pdf";
+
+  // Highlight the download that matches the visitor's machine.
+  const ua = navigator.userAgent;
+  const pick = /Win/i.test(ua) ? "win" : /Mac/i.test(ua) ? "mac" : /Linux|X11/i.test(ua) ? "linux" : null;
+  if (pick) {
+    const label = { win: "Windows", mac: "macOS", linux: "Linux" }[pick];
+    document.getElementById("dl-" + pick).classList.add("pick");
+    document.getElementById("primary").href = LATEST + files[pick];
+    document.getElementById("primary").textContent = "Download for " + label;
+    document.getElementById("detected").textContent =
+      "Free and open source. Also available for " +
+      ["Windows", "macOS", "Linux"].filter(n => n !== label).join(" and ") + ".";
+  }
+</script>
+</body>
+</html>

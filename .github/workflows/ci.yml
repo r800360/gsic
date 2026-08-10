@@ -1,0 +1,109 @@
+name: CI
+
+# Builds and tests on all three desktop platforms for every change.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            preset: windows-release
+            arch: x64
+          - name: Windows x86 (32-bit)
+            os: windows-latest
+            preset: windows-x86-release
+            arch: x86
+          - name: Linux x64
+            os: ubuntu-latest
+            preset: linux-release
+          - name: macOS arm64
+            os: macos-latest
+            preset: macos-release
+          - name: macOS x64 (Intel)
+            os: macos-15-intel
+            preset: macos-release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 32-bit MSVC needs the x86 toolchain on PATH before CMake looks for it.
+      - name: Select MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      # GLFW needs display server headers; the file dialog needs D-Bus.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build xorg-dev libwayland-dev \
+            libxkbcommon-dev libdbus-1-dev libltdl-dev autoconf-archive
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja autoconf automake libtool
+
+      - uses: lukka/get-cmake@latest
+        if: runner.os == 'Windows'
+
+      # The runner images ship vcpkg already; reuse it and cache the built
+      # packages so later runs skip the dependency build entirely.
+      - name: Set up vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
+          echo "Using vcpkg baseline $baseline"
+
+          git -C "$VCPKG_INSTALLATION_ROOT" fetch --depth=1 origin "$baseline"
+          git -C "$VCPKG_INSTALLATION_ROOT" checkout --force --detach "$baseline"
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg/archives
+            ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ matrix.preset }}-
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+  report:
+    name: Build report PDF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile LaTeX
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: docs/report.tex
+          work_in_root_file_dir: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report
+          path: docs/report.pdf

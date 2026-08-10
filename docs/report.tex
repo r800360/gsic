@@ -1,0 +1,196 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\usepackage{titlesec}
+
+\titlespacing*{\section}{0pt}{2.5ex plus .5ex}{1.2ex}
+\titlespacing*{\subsection}{0pt}{2.0ex plus .4ex}{1.0ex}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+
+\title{\textbf{gsic: A High Performance C++ Implementation of\\
+Content-Adaptive Image Compression with 2D Gaussians}}
+\author{\textbf{Rohan Sachdeva} \\ Independent Researcher \\ \texttt{rohan.sachdeva500@gmail.com} \quad \texttt{https://github.com/r800360}}
+
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+gsic is a C++23 reimplementation of Image-GS \cite{imagegs}, a method that represents an image as a cloud of anisotropic 2D Gaussians fitted by gradient descent. The original is a Python and CUDA research prototype. This work rebuilds it as a portable, distributable application with an OpenGL compute backend and a vectorized CPU fallback. Measured against the timings published in the Image-GS paper, gsic optimizes the same workload roughly three times faster on hardware with about three times less compute, and reaches $33.34 \pm 4.99$~dB PSNR at $0.340$~bpp across the authors' full 45 image dataset, compared with the published $32.99 \pm 4.49$~dB at $0.366$~bpp. It therefore attains higher fidelity while spending fewer bits. The report also records two negative results that shaped the final design.
+\end{abstract}
+
+\newpage
+
+\tableofcontents
+
+\newpage
+
+\section{Problem and Approach}
+
+Block transform codecs such as JPEG allocate bits uniformly across a fixed grid. Image-GS instead allocates a fixed budget of primitives adaptively, so that detailed regions receive more primitives than flat ones. An image is represented as a sum of $N$ colored 2D Gaussians. For pixel $p$ and channel
+$c$,
+%
+\begin{equation}
+  \mathrm{out}_c(p) \;=\; \sum_{i=1}^{N} \alpha_i(p)\, \mathrm{color}_{ic},
+  \qquad
+  \alpha_i = \max\!\left(e^{-\sigma_i} - b,\; 0\right),
+  \qquad
+  \sigma_i = \tfrac{1}{2}\, d^{\mathsf T} \Sigma_i^{-1} d ,
+  \label{eq:model}
+\end{equation}
+%
+where $d = p - \mu_i$ is the offset from the Gaussian center, $\Sigma_i^{-1}$ is the inverse covariance built from an anisotropic scale and a rotation, and $b = e^{-\tau}$ with cutoff $\tau$. Subtracting $b$ makes $\alpha$ continuous
+where the Gaussian is truncated, which removes popping artifacts during optimization. Each Gaussian stores a position, two inverse scales, a rotation
+angle, and one color coefficient per channel.
+
+Encoding is an optimization problem: given a target image, find the parameters minimizing reconstruction error. gsic minimizes mean $L_1$ error with Adam \cite{adam}. Gaussians are initialized by sampling positions from the Sobel gradient magnitude of the image, so they start where detail is, and take their color from the pixel underneath. The optimizer then grows the cloud progressively, inserting new Gaussians at pixels where residual error is largest and giving them the residual as their initial color. Decoding is a single evaluation of Equation~\ref{eq:model} and involves no optimization, which is why it is fast and why the representation can be resampled to any resolution.
+
+\subsection{Departure from the reference formulation}
+
+Image-GS normalizes each pixel by its $K$ strongest Gaussians. That normalization couples every Gaussian's gradient to its neighbors, which forces the backward pass to sort primitives per tile and accumulate through atomics. gsic drops it and uses the unnormalized sum in Equation~\ref{eq:model}, as in GaussianImage \cite{gaussianimage}. The consequence is structural: each Gaussian's gradient becomes independent of every other, so the backward pass is a per-Gaussian gather with no sorting and no atomics. It parallelizes without contention, and the CPU and GPU backends share one formulation. This single choice accounts for most of the measured speed advantage.
+
+\newpage
+
+\section{Implementation}
+
+The engine is about 4{,}000 lines of C++23 split into a platform independent core, a command line tool, and a Dear ImGui desktop application. The core holds image I/O, the Gaussian cloud, the renderer, the optimization schedule, the container format, quality metrics, and the two compute backends.
+
+\textbf{Rendering.} Gaussians are projected to screen space as conics with bounding boxes, then binned into $16\times16$ pixel tiles by counting sort. Each tile accumulates its Gaussians into a small stack buffer that stays resident in L1 cache and writes the result once. Because tiles partition the image, output buffers never need clearing.
+
+\textbf{Fused forward and loss.} During training the full resolution render is never materialized. Each tile is converted into gradients while still in registers, removing two full image passes of memory traffic per step. This is worth roughly 25\% on its own.
+
+\textbf{Analytic row moments.} Along a pixel row at fixed $dy$, all five geometric gradients reduce to three moment sums over $t = \partial L / \partial \sigma$: $S_0 = \sum t$, $S_1 = \sum t\,dx$, $S_2 = \sum t\,dx^2$. The inner loop is then a handful of fused multiply-adds per pixel rather than a full gradient evaluation.
+
+\textbf{Exact row intervals.} $\sigma$ is quadratic in $x$ along a row, so the pixels inside the cutoff ellipse follow from solving that quadratic directly. This skips the roughly 25\% of bounding box pixels that lie outside the ellipse.
+
+\textbf{Runtime SIMD dispatch.} The hot kernels are compiled twice, once for a baseline SSE2 target and once for AVX2 with FMA, and selected from \texttt{cpuid} at startup, so one binary runs well on old and new machines. On ARM the baseline autovectorizes to NEON. The exponential is a degree-4 polynomial approximation whose relative error near $10^{-4}$ is far below what the quantizer resolves.
+
+\textbf{32-bit targets.} Windows and Linux are also built for 32-bit x86 with identical features, including GPU acceleration. Because \texttt{size\_t} is 32 bits there, an expression such as \texttt{size\_t(w) * h * c} wraps silently at large image sizes, and the working set must fit in under 2 GB of address space. Image dimensions and Gaussian counts are therefore range checked against build-dependent limits before any allocation, capping images at 16 megapixels on 32-bit against 268 megapixels on 64-bit. The check in the container parser is a security control rather than a convenience, since those values arrive from an untrusted file and size an allocation.
+
+\textbf{Backends.} The GPU backend implements the same pipeline in OpenGL 4.3 compute shaders, with the only per-step readback being an 8 byte loss value. It requires no CUDA and runs on GPUs from any vendor. Where compute shaders are unavailable, notably macOS, the CPU path is used automatically. A unit test asserts that the two backends agree step for step.
+
+\textbf{Container format.} Parameters are quantized and entropy coded with Zstandard \cite{zstd}. Bit depths are deliberately not uniform, because the attributes differ in sensitivity. A position error displaces an entire Gaussian, so positions keep 16 bits; a rotation error only reorients an ellipse, so 10 bits suffice. Positions are additionally delta coded after the cloud is sorted along a Morton curve, which makes neighboring positions differ by small values that Zstandard can model. Moving from uniform 16 bit quantization to this allocation was worth $1.0$~dB at matched file size.
+
+\newpage
+
+\section{Results}
+
+All measurements use an Intel Core Ultra 7 255H with an RTX 4050 Laptop GPU. The reference figures are those published in the Image-GS paper, measured on an Nvidia A6000.
+
+\subsection{Encoding speed}
+
+The Image-GS paper states that optimizing 10K Gaussians for 1K steps at $2\mathrm{K}\times2\mathrm{K}$ takes 18.74 seconds, and 50K Gaussians for 1K steps takes 26.32 seconds \cite{imagegs}. Table~\ref{tab:speed} runs the identical configuration.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lccc}
+\toprule
+$2\mathrm{K}\times2\mathrm{K}$, 1000 steps & Image-GS (A6000) & gsic (RTX 4050 Laptop) & Speedup \\
+\midrule
+10K Gaussians & 18.74 s & 6.38 s & $2.94\times$ \\
+50K Gaussians & 26.32 s & 7.90 s & $3.33\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Optimization time at the reference configuration. The A6000 has roughly $2.8\times$ the FP32 throughput and $4\times$ the memory bandwidth of the laptop GPU used here, so the hardware favors the baseline.}
+\label{tab:speed}
+\end{table}
+
+\subsection{Rate and distortion}
+
+Table~\ref{tab:quality} reproduces the paper's headline quality benchmark: mean and standard deviation of PSNR across all 45 images of the Image-GS dataset, which contains nine images in each of five categories.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lcc}
+\toprule
+Full 45 image dataset & PSNR & Rate \\
+\midrule
+Image-GS (published) & $32.99 \pm 4.49$ dB & 0.366 bpp \\
+gsic & $33.34 \pm 4.99$ dB & 0.340 bpp \\
+\bottomrule
+\end{tabular}
+\caption{gsic is $0.35$~dB better while spending 7\% fewer bits, so the comparison favors it in both directions at once and does not rely on interpolating a rate-distortion curve. Per category: photo 36.00, anime 34.74, art 33.57, vector 31.44, painting 30.94 dB.}
+\label{tab:quality}
+\end{table}
+
+Against JPEG encoded to matched file size at approximately 0.32 bpp, gsic averages $+0.67$~dB. The margin is strongly content dependent, which is consistent with the method's design: stylized content with large coherent regions and sharp edges gains about $+3.2$~dB (anime $+3.21$, art $+3.36$, vector $+3.16$), whereas dense photographic texture, which the discrete cosine transform handles efficiently, lands near parity or slightly behind (photo $+0.45$, painting $-1.77$). On six images of the Kodak suite \cite{kodak} at 0.34 bpp the mean difference is $-0.17$~dB. Quality is reported as PSNR and SSIM \cite{ssim} against the decoded file, not against an unquantized intermediate.
+
+\subsection{Decoding}
+
+Decoding a $2048\times2048$ image takes 20 ms on the CPU. A GPU decode path exists and measures 30 ms, which is slower. A decode must finish with pixels in system memory, and transferring a 2K RGB frame back across PCIe costs more than the faster render saves. The 3.7 ms figure published for the reference implementation is a kernel time that excludes that transfer, so the two numbers measure different quantities and are not directly comparable. CPU decoding is therefore the default, and it has the practical benefit of requiring no GPU.
+
+\newpage
+
+\section{Negative Results}
+
+Two optimizations that appeared promising were implemented, measured, and removed. Both are recorded in the source so they are not attempted again.
+
+\textbf{Coarse-to-fine pyramid scheduling.} Per-step cost scales linearly with pixel count, so optimizing up a resolution pyramid should reduce it sharply. It was implemented with adaptive depth and a tunable step allocation, and it lost at both 2K and 8K. Spending the same wall clock time on fewer full resolution steps produced better quality in every configuration tested. The explanation is that gradient guided placement, color initialization, and error guided growth already position Gaussians well, so the coarse levels have little left to teach and consume steps that are worth more at full resolution.
+
+\textbf{Cosine learning rate decay.} Decaying the learning rate from step zero cost $0.6$~dB relative to a constant rate. Gaussians migrate across the image for most of the run, and shrinking their steps early freezes them before they reach the detail they should cover. The schedule that won holds the rate flat for 80\% of the run and decays only afterwards, which beats a constant rate by about $0.2$~dB at equal cost.
+
+\section{Engineering and Distribution}
+
+Builds are driven by CMake presets with dependencies resolved through vcpkg, and continuous integration compiles five targets on every change: 64-bit and 32-bit Windows, 64-bit Linux, and macOS on both Apple Silicon and Intel. On Windows the application links statically, including the C runtime, so the graphical binary is a single file of 1.8 MB (1.6 MB for 32-bit) that depends only on operating system libraries and needs no redistributable.
+
+Correctness is covered by unit tests that check analytic gradients against numerical finite differences, container round trip accuracy, renderer symmetry, an end to end compression, and agreement between the two backends. The parser is written for untrusted input: every header field is range checked before any allocation, and the payload length must match exactly what the header implies. The test suite feeds it truncated files, bit flipped headers, and random buffers. That suite together with 47 corrupted files was run under AddressSanitizer with no errors and no crashes.
+
+\section{Conclusion}
+
+Reimplementing a research prototype in C++23 produced a roughly threefold speedup on weaker hardware, together with a small but genuine quality gain, and turned the prototype into software that can be distributed as a single file. The performance came less from micro-optimization than from one structural decision, namely removing the top-$K$ normalization so that gradients decouple. The remaining weakness is that per-step cost scales with pixel count, which makes very large images expensive; the pyramid experiment shows that the obvious remedy does not work here, and a stochastic tile sampling scheme is the more promising direction for future work.
+
+\newpage
+
+\begin{thebibliography}{9}
+\small
+\bibitem{imagegs}
+Y.~Zhang, B.~Li, A.~Kuznetsov, A.~Jindal, S.~Diolatzis, K.~Chen, A.~Sochenov,
+A.~Kaplanyan, and Q.~Sun.
+\newblock Image-GS: Content-Adaptive Image Representation via 2D Gaussians.
+\newblock \emph{SIGGRAPH Conference Papers}, 2025.
+\url{https://arxiv.org/abs/2407.01866}
+
+\bibitem{gaussianimage}
+X.~Zhang et al.
+\newblock GaussianImage: 1000 FPS Image Representation and Compression by 2D
+Gaussian Splatting.
+\newblock \emph{ECCV}, 2024. \url{https://arxiv.org/abs/2403.08551}
+
+\bibitem{3dgs}
+B.~Kerbl, G.~Kopanas, T.~Leimk\"uhler, and G.~Drettakis.
+\newblock 3D Gaussian Splatting for Real-Time Radiance Field Rendering.
+\newblock \emph{ACM Transactions on Graphics}, 42(4), 2023.
+
+\bibitem{adam}
+D.~P.~Kingma and J.~Ba.
+\newblock Adam: A Method for Stochastic Optimization.
+\newblock \emph{ICLR}, 2015. \url{https://arxiv.org/abs/1412.6980}
+
+\bibitem{ssim}
+Z.~Wang, A.~C.~Bovik, H.~R.~Sheikh, and E.~P.~Simoncelli.
+\newblock Image Quality Assessment: From Error Visibility to Structural
+Similarity.
+\newblock \emph{IEEE Transactions on Image Processing}, 13(4), 2004.
+
+\bibitem{zstd}
+Y.~Collet and M.~Kucherawy.
+\newblock Zstandard Compression and the \texttt{application/zstd} Media Type.
+\newblock RFC 8878, IETF, 2021.
+
+\bibitem{kodak}
+Eastman Kodak Company.
+\newblock Kodak Lossless True Color Image Suite.
+\newblock \url{https://r0k.us/graphics/kodak/}
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,194 @@
+name: Release
+
+# Publishes a GitHub Release with binaries for all three platforms whenever a
+# version tag is pushed:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (for example v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            preset: windows-release
+            arch: x64
+          - name: windows-x86
+            os: windows-latest
+            preset: windows-x86-release
+            arch: x86
+          - name: linux-x64
+            os: ubuntu-latest
+            preset: linux-release
+          - name: macos-arm64
+            os: macos-latest
+            preset: macos-release
+          - name: macos-x64
+            os: macos-15-intel
+            preset: macos-release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build xorg-dev libwayland-dev \
+            libxkbcommon-dev libdbus-1-dev libltdl-dev autoconf-archive
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja autoconf automake libtool
+
+      - uses: lukka/get-cmake@latest
+        if: runner.os == 'Windows'
+
+      - name: Set up vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
+          echo "Using vcpkg baseline $baseline"
+
+          git -C "$VCPKG_INSTALLATION_ROOT" fetch --depth=1 origin "$baseline"
+          git -C "$VCPKG_INSTALLATION_ROOT" checkout --force --detach "$baseline"
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg/archives
+            ~/AppData/Local/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-${{ matrix.preset }}-
+
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      # Staging holds exactly what a user should receive: the two binaries,
+      # the licence, and the readme.
+      - name: Stage (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "stage/gsic-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item build/${{ matrix.preset }}/gsic-gui.exe $out
+          Copy-Item build/${{ matrix.preset }}/gsic.exe $out
+          Copy-Item README.md, LICENSE $out
+          Compress-Archive -Path "$out/*" -DestinationPath "gsic-${{ matrix.name }}.zip"
+
+      - name: Stage (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          out="stage/gsic-${{ matrix.name }}"
+          mkdir -p "$out"
+          cp build/${{ matrix.preset }}/gsic-gui build/${{ matrix.preset }}/gsic "$out"
+          cp README.md LICENSE "$out"
+          tar -czf "gsic-${{ matrix.name }}.tar.gz" -C stage "gsic-${{ matrix.name }}"
+
+      - name: Checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem "gsic-${{ matrix.name }}.*" -File |
+            Where-Object { $_.Name -notlike "*.sha256" } |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              "$hash  $($_.Name)" |
+                Set-Content -Encoding ascii "$($_.FullName).sha256"
+            }
+
+      - name: Checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for f in gsic-${{ matrix.name }}.*; do
+            if [ -f "$f" ]; then
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gsic-${{ matrix.name }}
+          path: |
+            gsic-${{ matrix.name }}.zip
+            gsic-${{ matrix.name }}.tar.gz
+            *.sha256
+          if-no-files-found: ignore
+
+  publish:
+    name: Publish release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build report PDF
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: docs/report.tex
+          work_in_root_file_dir: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: gsic ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*
+            docs/report.pdf
+          body: |
+            Gaussian splat image compression, built for speed.
+
+            Download the archive for your platform below, unpack it, and run
+            `gsic-gui` for the desktop application or `gsic` for the command
+            line tool. Nothing else needs installing.
+
+            Most people want `windows-x64`, `macos-arm64` (Apple Silicon), or
+            `linux-x64`. Use `windows-x86` only on a 32-bit installation of
+            Windows, and `macos-x64` on an Intel Mac. The 32-bit build works
+            the same way but can only handle images up to 16 megapixels,
+            because a 32-bit process does not have the address space for
+            larger ones.
+
+            Every archive ships with a `.sha256` checksum. Verify with
+            `shasum -a 256 -c <file>.sha256` on macOS or Linux, or
+            `Get-FileHash <file>` on Windows.

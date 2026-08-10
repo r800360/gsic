@@ -1,0 +1,23 @@
+{
+  "name": "gsic",
+  "version": "1.0.0",
+  "description": "Gaussian splat image compressor: content-adaptive image compression with 2D Gaussians.",
+  "builtin-baseline": "39344dff01c5a5a0134caf2624cdd492f05d30ea",
+  "dependencies": [
+    "glfw3",
+    "glad",
+    "stb",
+    "zstd",
+    "nativefiledialog-extended",
+    {
+      "name": "imgui",
+      "features": ["docking-experimental", "glfw-binding", "opengl3-binding"]
+    }
+  ],
+  "features": {
+    "tracy": {
+      "description": "Enable Tracy profiler instrumentation",
+      "dependencies": ["tracy"]
+    }
+  }
+}

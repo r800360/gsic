@@ -1,0 +1,143 @@
+name: MSIX
+
+# Builds the Microsoft Store package. Run manually from the Actions tab, or
+# automatically alongside a version tag. The output is an unsigned .msix.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  msix:
+    environment: microsoft-store
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            preset: windows-release
+          - arch: x86
+            preset: windows-x86-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+
+      - name: Select MSVC toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Set up vcpkg
+        shell: bash
+        run: |
+          baseline="$(python -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
+          echo "Using vcpkg baseline $baseline"
+
+          git -C "$VCPKG_INSTALLATION_ROOT" fetch --depth=1 origin "$baseline"
+          git -C "$VCPKG_INSTALLATION_ROOT" checkout --force --detach "$baseline"
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            "$VCPKG_INSTALLATION_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> "$GITHUB_ENV"
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: vcpkg-Windows-${{ matrix.preset }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-Windows-${{ matrix.preset }}-
+
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Assemble package layout
+        shell: pwsh
+        env:
+          MSIX_IDENTITY_NAME: ${{ secrets.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER: ${{ secrets.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ secrets.MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_IDENTITY_NAME)) {
+            throw "MSIX_IDENTITY_NAME is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_PUBLISHER)) {
+            throw "MSIX_PUBLISHER is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_PUBLISHER_DISPLAY_NAME)) {
+            throw "MSIX_PUBLISHER_DISPLAY_NAME is not configured."
+          }
+
+          $layout = "msix-layout"
+
+          New-Item -ItemType Directory -Force "$layout/Assets" | Out-Null
+
+          Copy-Item build/${{ matrix.preset }}/gsic-gui.exe $layout
+          Copy-Item build/${{ matrix.preset }}/gsic.exe $layout
+          Copy-Item packaging/msix/AppxManifest.xml $layout
+          Copy-Item packaging/msix/Assets/* "$layout/Assets"
+
+          [xml]$manifest = Get-Content "$layout/AppxManifest.xml"
+
+          $ns = New-Object System.Xml.XmlNamespaceManager($manifest.NameTable)
+          $ns.AddNamespace("f", $manifest.DocumentElement.NamespaceURI)
+
+          $identity = $manifest.SelectSingleNode(
+            "/f:Package/f:Identity",
+            $ns
+          )
+
+          $identity.SetAttribute("Name", $env:MSIX_IDENTITY_NAME)
+          $identity.SetAttribute("Publisher", $env:MSIX_PUBLISHER)
+          $identity.SetAttribute(
+            "ProcessorArchitecture",
+            "${{ matrix.arch }}"
+          )
+
+          $publisherDisplayName = $manifest.SelectSingleNode(
+            "/f:Package/f:Properties/f:PublisherDisplayName",
+            $ns
+          )
+
+          $publisherDisplayName.InnerText = `
+            $env:MSIX_PUBLISHER_DISPLAY_NAME
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}" -replace '^v',''
+            $parts = $v.Split('.')
+
+            while ($parts.Count -lt 3) {
+              $parts += '0'
+            }
+
+            $version = `
+              "$($parts[0]).$($parts[1]).$($parts[2]).0"
+
+            $identity.SetAttribute("Version", $version)
+
+            Write-Host "Manifest version set to $version"
+          }
+
+          $manifest.Save(
+            (Resolve-Path "$layout/AppxManifest.xml")
+          )
+
+          Write-Host "Microsoft Store package identity configured."
+
+      - name: Build MSIX
+        shell: pwsh
+        run: |
+          $sdk = Get-ChildItem "C:/Program Files (x86)/Windows Kits/10/bin" -Directory |
+                 Where-Object { Test-Path "$($_.FullName)/x64/makeappx.exe" } |
+                 Sort-Object Name -Descending | Select-Object -First 1
+          & "$($sdk.FullName)/x64/makeappx.exe" pack /d msix-layout /p gsic-${{ matrix.arch }}.msix /o
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gsic-msix-${{ matrix.arch }}
+          path: gsic-${{ matrix.arch }}.msix
