@@ -5,8 +5,8 @@
 1 ICON "../../packaging/gsic.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     1,0,1,0
+PRODUCTVERSION  1,0,1,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "gsic project"
             VALUE "FileDescription",  "Gaussian Splat Image Compressor"
-            VALUE "FileVersion",      "1.0.0"
+            VALUE "FileVersion",      "1.0.1"
             VALUE "InternalName",     "gsic-gui"
             VALUE "LegalCopyright",   "MIT License"
             VALUE "OriginalFilename", "gsic-gui.exe"
             VALUE "ProductName",      "gsic"
-            VALUE "ProductVersion",   "1.0.0"
+            VALUE "ProductVersion",   "1.0.1"
         END
     END
     BLOCK "VarFileInfo"

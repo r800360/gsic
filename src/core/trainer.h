@@ -7,6 +7,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace gsic {
 
@@ -55,7 +56,37 @@ struct EncodeSettings {
 
     std::uint32_t seed = 123;
     Backend backend = Backend::Auto;
-    int preview_interval_ms = 250;    // 0 disables preview snapshots
+
+    // Shortest gap between preview snapshots; 0 disables them entirely.
+    // Treated as a lower bound rather than the actual rate, because a
+    // snapshot renders the whole image and so costs more the larger the
+    // image is. Holding the interval fixed while that cost grows spends an
+    // unbounded fraction of the encode on previews: at 12 megapixels a
+    // snapshot measures 132 ms, so a 250 ms interval was giving up around
+    // 40% of the run to drawing pictures of it. See preview_time_fraction.
+    int preview_interval_ms = 250;
+    // Ceiling on the share of encode time spent producing previews. The
+    // interval stretches automatically to respect it.
+    double preview_time_fraction = 0.10;
+
+    // Wall-clock target for the optimization loop, in seconds. Zero means no
+    // limit, which is the right default for a library and a command line
+    // tool: the step count is then fixed, so the encode is reproducible.
+    //
+    // The desktop application sets it, and accepts what that costs. Per-step
+    // work scales with pixel count, so a step count chosen to look good on
+    // one machine is a multi-minute wait on a slower one with a larger image,
+    // and a person watching a progress bar reasonably concludes the feature
+    // does not work. Quality against steps has sharp diminishing returns --
+    // measured on a 12 MP image, the last half of a 3000 step run costs 143
+    // seconds and buys 1.15 dB -- so trading the tail of that curve for a
+    // predictable wait is a good exchange, and the alternative is not a
+    // slower result but no result.
+    double time_budget_seconds = 0.0;
+    // Never cut below this many steps, whatever the budget says. Under about
+    // 250 steps quality falls away quickly, and a finished-but-poor image is
+    // not what anyone was asking for either.
+    int min_budget_steps = 250;
 };
 
 struct EncodeProgress {
@@ -63,6 +94,10 @@ struct EncodeProgress {
     float loss = 0.f;
     int num_gaussians = 0;
     const Image* preview = nullptr;   // non-null when a snapshot was taken
+    double elapsed_seconds = 0.0;
+    // Projected total for the optimization loop, from throughput so far.
+    // Zero until enough steps have run to mean anything.
+    double estimated_total_seconds = 0.0;
 };
 
 struct EncodeStats {
@@ -70,10 +105,19 @@ struct EncodeStats {
     double encode_seconds = 0;    // everything: init, optimize, quantize, measure
     double optimize_seconds = 0;  // the optimization loop alone
     int steps_run = 0;
+    // What the settings asked for, before any time budget cut it down. When
+    // these differ, the encode traded quality for a bounded wait and the
+    // interface should be able to say so.
+    int steps_requested = 0;
     int num_gaussians = 0;
     const char* backend_used = "cpu";
     std::int64_t file_bytes = 0;
     std::int64_t source_bytes = 0;    // w * h * c at 8 bits per channel
+    // Non-empty when the GPU was chosen, went wrong partway through, and the
+    // encode was redone on the CPU. Worth surfacing: the result is correct,
+    // but the machine has a GPU that cannot be trusted with this workload and
+    // the user is paying for it in time on every image.
+    std::string gpu_fallback_reason;
 };
 
 struct EncodeResult {
@@ -82,6 +126,12 @@ struct EncodeResult {
     Image reconstruction;             // decoded from the quantized parameters
     EncodeStats stats;
     bool cancelled = false;
+    // Empty on success. Set when no usable file could be produced, which is
+    // the only honest outcome for an encode that went wrong: writing bytes a
+    // decoder rejects is worse than reporting the failure.
+    std::string error;
+
+    bool ok() const { return error.empty() && !cancelled && !file.empty(); }
 };
 
 using ProgressFn = std::function<void(const EncodeProgress&)>;
@@ -102,6 +152,18 @@ public:
     virtual void snapshot(Image& out) = 0;
     // Pulls current parameters back into the cloud (no-op on CPU).
     virtual void sync_cloud(GaussianCloud& cloud) = 0;
+
+    // False once the backend has detected that its results can no longer be
+    // trusted. A backend that compiles and starts is not proof that it
+    // computes correctly: drivers differ, and a compute dispatch can fail
+    // partway through a run for reasons the caller cannot predict from the
+    // hardware alone. Reporting it lets the trainer abandon this backend and
+    // redo the encode on the CPU rather than write out whatever came back.
+    // `why` receives a description the user can be shown.
+    virtual bool healthy(std::string* why = nullptr) const {
+        (void)why;
+        return true;
+    }
 };
 
 // Compress one image. Blocks; call from a worker thread for UI use.
@@ -117,5 +179,13 @@ EncodeResult encode_image(const Image& target, const EncodeSettings& settings,
 std::unique_ptr<ITrainBackend> make_cpu_backend();
 std::unique_ptr<ITrainBackend> make_gpu_backend(std::string* why_not);
 // gpu_init / gpu_shutdown / gpu_render live in gpu.h.
+
+// Test seam. The mid-encode fallback can only be exercised by a backend that
+// fails partway through, and a machine whose GPU works will never produce
+// one. Installing a factory here lets the robustness suite inject that
+// failure on any hardware, so the recovery path is covered everywhere rather
+// than only on the machines where it is already broken.
+using BackendFactory = std::function<std::unique_ptr<ITrainBackend>(std::string*)>;
+void set_gpu_backend_factory_for_testing(BackendFactory factory);
 
 } // namespace gsic

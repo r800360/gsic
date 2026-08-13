@@ -247,6 +247,7 @@ int main(int argc, char** argv) {
         {50, 50, "StoreLogo.png"},
         {150, 150, "Square150x150Logo.png"},
         {256, 256, "icon.png"},
+        {300, 300, "StoreTile300x300.png"},   // Store listing tile
     };
     for (const Target& t : squares) {
         const Image img = render_mark(t.w, t.h);

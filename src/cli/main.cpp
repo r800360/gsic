@@ -1,7 +1,9 @@
 // gsic command line tool: compress, decompress, info, bench.
 #include "core/codec.h"
+#include "core/format.h"
 #include "core/gpu.h"
 #include "core/image.h"
+#include "core/kernels.h"
 #include "core/metrics.h"
 #include "core/renderer.h"
 #include "core/trainer.h"
@@ -14,7 +16,12 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifndef GSIC_VERSION
+#define GSIC_VERSION "unknown"
+#endif
 
 namespace fs = std::filesystem;
 using namespace gsic;
@@ -39,6 +46,7 @@ void print_usage() {
         "  gsic info <file.gsi>                    show file details\n"
         "  gsic bench [image] [options]            measure encode speed\n"
         "  gsic compare <a> <b>                    PSNR/SSIM between two images\n"
+        "  gsic diagnose                           report what this machine will do\n"
         "\n"
         "compress options:\n"
         "  -o <dir>          output directory (default: next to input)\n"
@@ -53,6 +61,8 @@ void print_usage() {
         "  --cpu / --gpu     force backend (default: auto with CPU fallback)\n"
         "  --png             also write the decoded .png next to the .gsi\n"
         "  --seed <n>        random seed (default: 123)\n"
+        "  --time-budget <s> stop early to finish within s seconds (default: no\n"
+        "                    limit, which keeps the encode reproducible)\n"
         "\n"
         "decompress options:\n"
         "  -o <file|dir>     output path\n"
@@ -96,15 +106,6 @@ void apply_preset(EncodeSettings& s, const std::string& preset) {
         std::fprintf(stderr, "unknown preset '%s'\n", preset.c_str());
         std::exit(2);
     }
-}
-
-std::string human_size(std::int64_t bytes) {
-    char buf[32];
-    if (bytes >= 1024 * 1024)
-        std::snprintf(buf, sizeof(buf), "%.2f MB", double(bytes) / (1024.0 * 1024.0));
-    else
-        std::snprintf(buf, sizeof(buf), "%.1f KB", double(bytes) / 1024.0);
-    return buf;
 }
 
 int cmd_compress(const std::vector<std::string>& inputs, EncodeSettings settings,
@@ -195,15 +196,17 @@ int cmd_decompress(const std::vector<std::string>& inputs, fs::path out_arg, flo
             ++failures;
             continue;
         }
-        int w = file->width, h = file->height;
-        GaussianCloud cloud = std::move(file->cloud);
-        if (scale != 1.f) {
-            w = std::max(1, int(w * scale));
-            h = std::max(1, int(h * scale));
-            const float ratio = float(w) / file->width;
-            for (auto& v : cloud.sinv_x) v /= ratio;   // keep size relative to image
-            for (auto& v : cloud.sinv_y) v /= ratio;
+        // The scaled-decode arithmetic and its range checking live in the
+        // core, so the window and this tool cannot disagree about what
+        // "--scale 2" means or about which scales are refused.
+        auto scaled = scale_gsi(*file, scale, &err);
+        if (!scaled) {
+            std::fprintf(stderr, "%s: %s\n", in.c_str(), err.c_str());
+            ++failures;
+            continue;
         }
+        const int w = scaled->w, h = scaled->h;
+        GaussianCloud cloud = std::move(scaled->cloud);
         const char* used = "cpu";
         const auto t0 = std::chrono::steady_clock::now();
         Image img = decode_render(cloud, w, h, backend, &used);
@@ -273,6 +276,80 @@ int cmd_compare(const std::string& a_path, const std::string& b_path) {
         return 1;
     }
     std::printf("PSNR %.2f dB  SSIM %.4f\n", psnr(*a, *b), ssim(*a, *b));
+    return 0;
+}
+
+// Everything about this machine that decides how the application behaves on
+// it, in one place.
+//
+// This exists because a bug report that says "compression does not work"
+// leaves nowhere to start. Whether the GPU was used, whether it was rejected
+// and for what, which CPU kernels were selected, how many threads there are,
+// and what an encode of a realistic image actually costs are all facts that
+// vary per machine, and none of them are visible from the outside. Asking
+// someone to run one command and paste the output turns an unreproducible
+// report into a reproducible one.
+int cmd_diagnose() {
+    std::printf("gsic %s diagnostics\n", GSIC_VERSION);
+    std::printf("  build          %d-bit, %s\n", int(sizeof(void*) * 8),
+                kIs32Bit ? "32-bit limits" : "64-bit limits");
+    std::printf("  cpu kernels    %s\n", kernels().name);
+    std::printf("  hardware threads %u\n", std::thread::hardware_concurrency());
+    std::printf("  image limits   %lld pixels, %d per side, %d gaussians\n",
+                static_cast<long long>(kMaxPixels), kMaxDimension, kMaxGaussians);
+
+    std::string why;
+    const bool gpu = gpu_init(&why);
+    if (gpu)
+        std::puts("  gpu            available, and it agreed with the CPU on the self-check");
+    else
+        std::printf("  gpu            NOT USED: %s\n", why.c_str());
+
+    // A realistic size, not a toy one: the per-step cost scales with pixels,
+    // so a 64x64 timing says nothing about what a photo will do.
+    struct Case { int w, h; const char* label; };
+    const Case cases[] = {{1024, 1024, "1 MP"}, {2048, 2048, "4 MP"}};
+    for (const Case& c : cases) {
+        Image img(c.w, c.h, 3);
+        std::uint32_t state = 1;
+        for (int ch = 0; ch < 3; ++ch) {
+            float* p = img.plane(ch);
+            for (int y = 0; y < img.h; ++y)
+                for (int x = 0; x < img.w; ++x) {
+                    state = state * 1664525u + 1013904223u;
+                    p[size_t(y) * img.w + x] =
+                        0.5f + 0.25f * std::sin(0.02f * (x + y * (ch + 1))) +
+                        0.1f * (float(state >> 8) / float(1 << 24) - 0.5f);
+                }
+        }
+        for (int pass = 0; pass < (gpu ? 2 : 1); ++pass) {
+            EncodeSettings s;
+            s.pixels_per_gaussian = 300;
+            s.max_steps = 300;   // short: this measures throughput, not quality
+            s.preview_interval_ms = 0;
+            s.backend = pass == 0 ? Backend::Cpu : Backend::Gpu;
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto r = encode_image(img, s);
+            const double secs =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!r.ok()) {
+                std::printf("  %-5s %-4s FAILED: %s\n", c.label, pass == 0 ? "cpu" : "gpu",
+                            r.error.c_str());
+                continue;
+            }
+            const double per_step = r.stats.optimize_seconds / std::max(1, r.stats.steps_run);
+            std::printf("  %-5s %-4s %6.1f steps/s -> a default 3000-step encode would take"
+                        " about %.0f s  (%.2f dB here)\n",
+                        c.label, r.stats.backend_used, 1.0 / std::max(1e-9, per_step),
+                        per_step * 3000.0, r.stats.psnr);
+            if (!r.stats.gpu_fallback_reason.empty())
+                std::printf("        the GPU %s partway through, so the CPU finished it\n",
+                            r.stats.gpu_fallback_reason.c_str());
+            (void)secs;
+        }
+    }
+    gpu_shutdown();
+    std::puts("\nIf compression seems not to work, paste all of the above into the report.");
     return 0;
 }
 
@@ -362,6 +439,14 @@ int main(int argc, char** argv) {
         else if (a == "--bits-color" && parse_int(next(), iv)) settings.quant.feat = iv;
         else if (a == "--seed" && parse_int(next(), iv)) settings.seed = std::uint32_t(iv);
         else if (a == "--max-scale") { if (!parse_float(next(), settings.max_scale_px)) { std::fprintf(stderr, "bad --max-scale\n"); return 2; } }
+        else if (a == "--time-budget") {
+            float secs = 0.f;
+            if (!parse_float(next(), secs) || secs < 0.f) {
+                std::fprintf(stderr, "bad --time-budget\n");
+                return 2;
+            }
+            settings.time_budget_seconds = double(secs);
+        }
         else if (a == "--no-lr-decay") settings.lr_decay = false;
         else if (a == "--cpu") settings.backend = Backend::Cpu;
         else if (a == "--gpu") settings.backend = Backend::Gpu;
@@ -380,17 +465,24 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // The GPU context is created here, on the main thread, or not at all: see
+    // gpu.h. Every command that might reach the GPU asks for it first rather
+    // than letting a deeper call site create it wherever it happens to run.
+    const auto want_gpu = [&](bool required) {
+        if (settings.backend == Backend::Cpu) return;
+        std::string why;
+        if (!gpu_init(&why) && required)
+            std::fprintf(stderr, "GPU unavailable: %s (falling back to CPU)\n", why.c_str());
+    };
+
     if (cmd == "compress") {
         if (inputs.empty()) { print_usage(); return 2; }
-        if (settings.backend != Backend::Cpu) {
-            std::string why;
-            if (!gpu_init(&why) && settings.backend == Backend::Gpu)
-                std::fprintf(stderr, "GPU unavailable: %s (falling back to CPU)\n", why.c_str());
-        }
+        want_gpu(settings.backend == Backend::Gpu);
         return cmd_compress(inputs, settings, out_dir, also_png);
     }
     if (cmd == "decompress") {
         if (inputs.empty()) { print_usage(); return 2; }
+        want_gpu(settings.backend == Backend::Gpu);
         return cmd_decompress(inputs, out_dir, scale, settings.backend);
     }
     if (cmd == "info") {
@@ -401,7 +493,11 @@ int main(int argc, char** argv) {
         if (inputs.size() != 2) { print_usage(); return 2; }
         return cmd_compare(inputs[0], inputs[1]);
     }
-    if (cmd == "bench") return cmd_bench(inputs.empty() ? "" : inputs[0], settings);
+    if (cmd == "diagnose") return cmd_diagnose();
+    if (cmd == "bench") {
+        want_gpu(settings.backend == Backend::Gpu);
+        return cmd_bench(inputs.empty() ? "" : inputs[0], settings);
+    }
     print_usage();
     return 2;
 }

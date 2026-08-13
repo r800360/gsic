@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(gsic VERSION 1.0.0 LANGUAGES C CXX)
+project(gsic VERSION 1.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -116,8 +116,17 @@ endif()
 # ------------------------------------------------------------------------- cli
 add_executable(gsic src/cli/main.cpp)
 target_link_libraries(gsic PRIVATE gsic_core)
+# So `gsic diagnose` reports the version it was built as; a diagnostic that
+# cannot say which build produced it is half a diagnostic.
+target_compile_definitions(gsic PRIVATE GSIC_VERSION="${PROJECT_VERSION}")
 
 # ------------------------------------------------------------------------- gui
+# The queue and compress-and-write pipeline, with no window attached, so the
+# tests can drive exactly what a user drives when they add an image.
+add_library(gsic_app_core STATIC src/app/pipeline.cpp src/app/settings.cpp)
+target_link_libraries(gsic_app_core PUBLIC gsic_core)
+target_include_directories(gsic_app_core PUBLIC src/app)
+
 add_executable(gsic-gui
   src/app/main.cpp
   src/app/app.cpp
@@ -134,8 +143,10 @@ if(WIN32)
     target_link_options(gsic-gui PRIVATE /LARGEADDRESSAWARE)
     target_link_options(gsic PRIVATE /LARGEADDRESSAWARE)
   endif()
+  # ShellExecuteW, for "Show in folder".
+  target_link_libraries(gsic-gui PRIVATE shell32)
 endif()
-target_link_libraries(gsic-gui PRIVATE gsic_core imgui::imgui glfw glad::glad nfd::nfd)
+target_link_libraries(gsic-gui PRIVATE gsic_app_core imgui::imgui glfw glad::glad nfd::nfd)
 
 # ------------------------------------------------------------------ logo tool
 # Regenerates the icon and Store assets from fixed constants. Not built by
@@ -152,7 +163,47 @@ add_custom_target(logo
 # ----------------------------------------------------------------------- tests
 if(GSIC_BUILD_TESTS)
   enable_testing()
+
+  # Unit level: kernels, codec, metrics, backend agreement.
   add_executable(gsic_tests tests/test_core.cpp)
   target_link_libraries(gsic_tests PRIVATE gsic_core)
   add_test(NAME core COMMAND gsic_tests)
+
+  # Regression level: quality and size baselines, determinism, decode
+  # fidelity. Catches "this change cost 2 dB", which unit tests cannot.
+  add_executable(gsic_regression tests/test_regression.cpp)
+  target_link_libraries(gsic_regression PRIVATE gsic_core)
+  add_test(NAME regression COMMAND gsic_regression)
+
+  # Application: the queue and compress-and-write pipeline the desktop app
+  # runs, driven the way a user drives it. No window required.
+  add_executable(gsic_app_tests tests/test_app.cpp)
+  target_link_libraries(gsic_app_tests PRIVATE gsic_app_core)
+  add_test(NAME app COMMAND gsic_app_tests)
+  set_tests_properties(app PROPERTIES TIMEOUT 600)
+
+  # Robustness: the failure paths that only appear on other people's
+  # hardware. Uses injection seams so a machine whose GPU works still
+  # exercises what happens on one whose GPU does not.
+  add_executable(gsic_robustness tests/test_robustness.cpp)
+  target_link_libraries(gsic_robustness PRIVATE gsic_core)
+  add_test(NAME robustness COMMAND gsic_robustness)
+
+  # End-to-end: drives the shipped executable, including its failure paths.
+  add_executable(gsic_cli_tests tests/test_cli.cpp)
+  target_link_libraries(gsic_cli_tests PRIVATE gsic_core)
+  add_test(NAME cli COMMAND gsic_cli_tests $<TARGET_FILE:gsic>)
+
+  # Interface: starts the real window, checks it actually renders, then
+  # compresses an image through it. This is the only test that can catch an
+  # app which opens to an empty window.
+  #
+  # It needs a desktop session, which hosted build runners do not always have.
+  # Rather than filtering it out of those runs from the CI configuration --
+  # where the omission would be invisible and would silently survive any
+  # future change -- the executable detects that it cannot open a window and
+  # exits with this code, which CTest reports as a skip with the reason
+  # attached.
+  add_test(NAME gui COMMAND gsic-gui --selftest)
+  set_tests_properties(gui PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()

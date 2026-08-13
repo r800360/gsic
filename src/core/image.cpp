@@ -97,8 +97,27 @@ bool Image::save_png(const std::filesystem::path& path) const {
         for (std::int64_t i = 0, n = pixels(); i < n; ++i)
             dst[i * c] = std::uint8_t(std::clamp(src[i], 0.f, 1.f) * 255.f + 0.5f);
     }
-    const std::string p = path.string();
-    return stbi_write_png(p.c_str(), w, h, c, out.data(), w * c) != 0;
+    // Writing through our own handle rather than stbi_write_png's path
+    // argument. That argument is a narrow string, and on Windows narrow paths
+    // go through the active code page, so a picture in a folder whose name is
+    // not representable there -- an accent, a non-Latin script -- fails to
+    // save on the user's machine and works on every machine that happens to
+    // use only ASCII. Image::load already opens wide for the same reason.
+    FILE* f = nullptr;
+#ifdef _WIN32
+    if (_wfopen_s(&f, path.c_str(), L"wb") != 0) f = nullptr;
+#else
+    f = std::fopen(path.c_str(), "wb");
+#endif
+    if (!f) return false;
+    const auto write = [](void* context, void* data, int size) {
+        std::fwrite(data, 1, size_t(size), static_cast<FILE*>(context));
+    };
+    const int ok = stbi_write_png_to_func(write, f, w, h, c, out.data(), w * c);
+    // Only a successful close proves the bytes reached the disk; a full volume
+    // or a disconnected drive surfaces here and nowhere earlier.
+    const bool closed = std::fclose(f) == 0;
+    return ok != 0 && closed;
 }
 
 Image Image::downscaled_half() const {

@@ -1,9 +1,12 @@
 #pragma once
 
+#include "codec.h"
 #include "gaussians.h"
 #include "image.h"
 #include "kernels.h"
 
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace gsic {
@@ -47,5 +50,36 @@ private:
     std::vector<std::uint32_t> tile_items_;
     std::vector<std::uint32_t> fill_cursor_;
 };
+
+// A parsed .gsi prepared for output at a size other than the one it was
+// stored at. Because the compressed representation is continuous rather than a
+// fixed raster, a scaled decode re-evaluates the gaussians at the requested
+// resolution instead of resampling an already-decoded image.
+struct ScaledDecode {
+    GaussianCloud cloud;
+    int w = 0, h = 0;
+    // What the scale actually became. Equal to the request unless it was
+    // clamped; the caller can then say so rather than silently producing a
+    // different size than was asked for.
+    float scale = 1.f;
+};
+
+// Largest and smallest decode scale offered. The upper bound is a policy
+// choice rather than a format limit -- the build's pixel ceiling is checked
+// separately and is what actually protects the allocation -- but a scale
+// spinner with no top invites an accidental 100x that looks like a hang.
+inline constexpr float kMinDecodeScale = 0.05f;
+inline constexpr float kMaxDecodeScale = 8.f;
+
+// Prepares `file` for rendering at `scale` times its stored resolution.
+// Returns nullopt with a reason when the result would exceed this build's
+// image limits, so an out-of-range request is refused before anything is
+// allocated rather than during.
+std::optional<ScaledDecode> scale_gsi(const GsiFile& file, float scale,
+                                      std::string* error = nullptr);
+
+// Decodes a parsed .gsi to an image at `scale` times its stored resolution.
+// Returns an empty image (and sets `error`) when the scale is out of range.
+Image render_gsi(const GsiFile& file, float scale = 1.f, std::string* error = nullptr);
 
 } // namespace gsic

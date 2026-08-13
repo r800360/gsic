@@ -283,6 +283,16 @@ void append_gaussians(GaussianCloud& cloud, const Image& target,
 
 } // namespace
 
+namespace {
+// See set_gpu_backend_factory_for_testing in trainer.h. Read on the encode
+// thread, written by tests before an encode starts.
+BackendFactory g_gpu_factory_override;
+}  // namespace
+
+void set_gpu_backend_factory_for_testing(BackendFactory factory) {
+    g_gpu_factory_override = std::move(factory);
+}
+
 #if !defined(GSIC_ENABLE_GPU)
 std::unique_ptr<ITrainBackend> make_gpu_backend(std::string* why_not) {
     if (why_not) *why_not = "built without GPU support";
@@ -313,167 +323,348 @@ EncodeResult encode_image(const Image& target, const EncodeSettings& settings,
     n_total = int(std::clamp<std::int64_t>(
         n_total, 16, std::min<std::int64_t>({pixels, 4'000'000, kMaxGaussians})));
     
-    // Backend selection with CPU fallback.
-    std::unique_ptr<ITrainBackend> backend;
-    if (settings.backend != Backend::Cpu) {
-        std::string why;
-        backend = make_gpu_backend(&why);
-        if (backend) result.stats.backend_used = "gpu";
-    }
-    if (!backend) backend = std::make_unique<CpuBackend>();
-    if (result.stats.backend_used != std::string("gpu"))
-        result.stats.backend_used = backend->name();
-
     const int max_steps = std::max(64, settings.max_steps);
     const Image* train_target = &target;
     const EncodeSettings* stage = &settings;
 
-    // --- Initial placement: image-gradient guided + a uniform random share.
-    std::mt19937 rng(settings.seed);
-    GaussianCloud& cloud = result.cloud;
-    cloud.channels = target.c;
-    const int n_initial =
-        settings.progressive ? std::max(16, int(std::ceil(settings.initial_ratio * n_total)))
-                             : n_total;
-    {
-        const std::int64_t tpixels = train_target->pixels();
-        std::vector<std::uint8_t> taken(size_t(tpixels), 0);
-        auto weights = gradient_weights(*train_target);
-        const int n_random = int(std::round(settings.init_random_ratio * n_initial));
-        std::vector<float> uniform(size_t(tpixels), 1.f);
-        auto random_px = weighted_sample(uniform, n_random, rng, taken);
-        auto guided_px = weighted_sample(weights, n_initial - n_random, rng, taken);
-        guided_px.insert(guided_px.end(), random_px.begin(), random_px.end());
-        append_gaussians(cloud, *train_target, guided_px, stage->init_scale_px,
-                         train_target->data.data());
-    }
+    // One full optimization run on a given backend. Everything it touches is
+    // derived from `settings.seed`, so a second call reproduces the first
+    // exactly; that is what makes retrying on the CPU a correct recovery and
+    // not a different encode. Returns false when the backend stopped being
+    // trustworthy partway through, leaving `result` untouched for the retry.
+    int step = 0;
+    auto run_optimization = [&](ITrainBackend& backend, std::string* why) -> bool {
+        // --- Initial placement: image-gradient guided + a uniform random share.
+        std::mt19937 rng(settings.seed);
+        GaussianCloud& cloud = result.cloud;
+        cloud = GaussianCloud{};
+        cloud.channels = target.c;
+        const int n_initial =
+            settings.progressive ? std::max(16, int(std::ceil(settings.initial_ratio * n_total)))
+                                 : n_total;
+        {
+            const std::int64_t tpixels = train_target->pixels();
+            std::vector<std::uint8_t> taken(size_t(tpixels), 0);
+            auto weights = gradient_weights(*train_target);
+            const int n_random = int(std::round(settings.init_random_ratio * n_initial));
+            std::vector<float> uniform(size_t(tpixels), 1.f);
+            auto random_px = weighted_sample(uniform, n_random, rng, taken);
+            auto guided_px = weighted_sample(weights, n_initial - n_random, rng, taken);
+            guided_px.insert(guided_px.end(), random_px.begin(), random_px.end());
+            append_gaussians(cloud, *train_target, guided_px, stage->init_scale_px,
+                             train_target->data.data());
+        }
 
-    morton_sort(cloud);
-    if (!backend->prepare(*train_target, cloud, *stage)) {
+        morton_sort(cloud);
+        if (!backend.prepare(*train_target, cloud, *stage)) {
+            if (why) *why = "backend could not allocate its buffers";
+            return false;
+        }
+
+        // --- Optimization schedule.
+        //
+        // `budget_steps` is what the run will actually do. It starts as what
+        // was asked for and may be lowered once, early, by the wall-clock
+        // budget; everything derived from it is recomputed at that point, so
+        // the learning rate schedule and the progressive additions stay
+        // consistent with the run that is really happening rather than the one
+        // originally planned.
+        int budget_steps = max_steps;
+        const int adds_left_at_start = settings.progressive ? settings.add_times : 0;
+        const auto interval_for = [&](int steps) {
+            return adds_left_at_start > 0
+                       ? std::max(32, steps * 2 / (5 * (adds_left_at_start + 1)))
+                       : 0;
+        };
+        int add_interval = interval_for(budget_steps);
+        int adds_left = adds_left_at_start;
+        const int per_add =
+            adds_left > 0 ? (n_total - cloud.count() + adds_left - 1) / adds_left : 0;
+
+        // Enforcing the wall-clock budget.
+        //
+        // The obvious approach -- time a few early steps, divide, pick a step
+        // count -- does not work here, and the way it fails is worth naming.
+        // Per-step cost is not constant: the cloud doubles across the
+        // progressive additions, and the gaussians spread out as they
+        // optimize, so their total footprint (which is what the renderer
+        // actually costs) grows through the run. Measured on a 12 MP image,
+        // steps 8 to 24 run about five times faster than the run average, so
+        // an early extrapolation promised 30 seconds and delivered 152. A
+        // bound that is wrong by 5x is worse than no bound, because the
+        // interface repeats it to the user.
+        //
+        // So the budget is enforced by the clock, not by arithmetic done once
+        // at the start. `budget_steps` is a projection, re-estimated as the
+        // run proceeds and only ever revised downward; it exists to keep the
+        // learning-rate decay and the progressive additions pointed at a
+        // realistic end. The guarantee comes from the hard stop below it.
+        constexpr int kWarmupSteps = 8;
+        constexpr int kReprojectEvery = 32;
+        const bool budgeted = settings.time_budget_seconds > 0.0;
+        const int floor_steps =
+            std::min(max_steps, std::max(1, settings.min_budget_steps));
+        const auto loop_start = clock::now();
+        auto warmup_done = loop_start;
+
+        float lr_mult = 1.f;
+        int adam_t = 0;
+        Image preview;
+        auto last_preview = clock::now();
+        double snapshot_seconds = 0.0;   // cost of the most recent snapshot
+
+        for (step = 1; step <= budget_steps; ++step) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) {
+                result.cancelled = true;
+                break;
+            }
+            const float loss = backend.step(++adam_t, lr_mult);
+
+            if (step == kWarmupSteps) warmup_done = clock::now();
+            if (budgeted) {
+                const double elapsed =
+                    std::chrono::duration<double>(clock::now() - loop_start).count();
+
+                // The guarantee, checked every step. Reading the clock costs
+                // tens of nanoseconds against a step costing milliseconds, and
+                // checking it only periodically would let the run overshoot by
+                // however much a whole window of late steps costs -- which on
+                // a large image is seconds, in the one situation where the
+                // bound was the point.
+                if (elapsed >= settings.time_budget_seconds && step >= floor_steps) {
+                    budget_steps = step;
+                    break;
+                }
+
+                // The projection. This does not enforce anything; it keeps the
+                // learning-rate decay and the progressive additions aimed at
+                // where the run will actually end, so the schedule is not
+                // planned around a finish the run will never reach.
+                if (step > kWarmupSteps && step % kReprojectEvery == 0) {
+                    const double per_step = elapsed / double(step);
+                    if (per_step > 0.0) {
+                        const double remaining = settings.time_budget_seconds - elapsed;
+                        const int projected =
+                            std::clamp(step + int(remaining / per_step), floor_steps, max_steps);
+                        // Downward only. Per-step cost rises as the cloud grows
+                        // and the gaussians spread, so the average so far is
+                        // always an optimistic estimate of what is left; a
+                        // projection allowed to grow again would be chasing it.
+                        if (projected < budget_steps) {
+                            budget_steps = projected;
+                            add_interval = interval_for(budget_steps);
+                        }
+                    }
+                }
+            }
+
+            // Two ways a backend can stop being usable mid-run: it can say so
+            // itself, or it can quietly start returning garbage. A loss that
+            // is not a finite number is the earliest visible symptom of the
+            // second, and continuing from it only produces a file whose own
+            // decoder will reject it.
+            if (!std::isfinite(loss)) {
+                if (why) *why = "produced a non-finite loss";
+                return false;
+            }
+            if (!backend.healthy(why)) return false;
+
+            // Progressive addition: place new gaussians where error is largest.
+            //
+            // Scheduled by "have we reached the step this addition was due"
+            // rather than by an exact multiple, because add_interval moves
+            // when the budget is revised. An exact test would step straight
+            // over an addition whose due step had just been recomputed, and
+            // the run would quietly end with fewer gaussians than the settings
+            // asked for -- visible to the user only as a file of the wrong
+            // size.
+            const int next_add_step = add_interval * (adds_left_at_start - adds_left + 1);
+            if (adds_left > 0 && step >= next_add_step) {
+                GSIC_ZONE("add_gaussians");
+                const int add_n = std::min(per_add, n_total - cloud.count());
+                if (add_n > 0) {
+                    const Image& tt = *train_target;
+                    const std::int64_t tpixels = tt.pixels();
+                    backend.sync_cloud(cloud);
+                    Image recon;
+                    backend.snapshot(recon);
+                    // Error map (mean |diff| over channels, squared) with a 3x3
+                    // blur so isolated noisy pixels don't dominate the sampling.
+                    std::vector<float> err(size_t(tpixels), 0.f);
+                    std::vector<float> diff(size_t(tpixels) * tt.c);
+                    const float inv_c = 1.f / tt.c;
+                    for (int c = 0; c < tt.c; ++c) {
+                        const float* r = recon.plane(c);
+                        const float* t = tt.plane(c);
+                        float* d = diff.data() + size_t(c) * tpixels;
+                        for (size_t i = 0, np = size_t(tpixels); i < np; ++i) {
+                            d[i] = t[i] - r[i];
+                            err[i] += std::fabs(d[i]) * inv_c;
+                        }
+                    }
+                    std::vector<float> err_blur(size_t(tpixels), 0.f);
+                    for (int y = 0; y < tt.h; ++y)
+                        for (int x = 0; x < tt.w; ++x) {
+                            float s = 0.f;
+                            for (int dy = -1; dy <= 1; ++dy)
+                                for (int dx = -1; dx <= 1; ++dx)
+                                    s += err[size_t(std::clamp(y + dy, 0, tt.h - 1)) * tt.w +
+                                             size_t(std::clamp(x + dx, 0, tt.w - 1))];
+                            err_blur[size_t(y) * tt.w + x] = s * s;  // squared like the paper
+                        }
+                    std::vector<std::uint8_t> taken(size_t(tpixels), 0);
+                    auto px = weighted_sample(err_blur, add_n, rng, taken);
+                    // New gaussians take the residual as color so they immediately
+                    // reduce the error they were placed on.
+                    append_gaussians(cloud, tt, px, stage->init_scale_px, diff.data());
+                    morton_sort(cloud);
+                    if (!backend.prepare(tt, cloud, *stage)) {
+                        if (why) *why = "backend could not grow its buffers";
+                        return false;
+                    }
+                    adam_t = 0;
+                }
+                --adds_left;
+            }
+
+            // Learning rate holds flat, then decays over the last stretch.
+            // Decaying earlier measurably hurts: gaussians keep migrating across
+            // the image for most of the run, and shrinking their steps too soon
+            // freezes them before they reach the detail they should cover. The
+            // final decay only settles what is already in place.
+            if (settings.lr_decay) {
+                const float progress = float(step) / float(budget_steps);
+                if (progress > kLrDecayStart) {
+                    const float t = (progress - kLrDecayStart) / (1.f - kLrDecayStart);
+                    lr_mult = kLrFloor + (1.f - kLrFloor) * 0.5f *
+                                             (1.f + std::cos(std::numbers::pi_v<float> * t));
+                }
+            }
+
+            if (on_progress) {
+                const auto now = clock::now();
+                // How long to wait before the next snapshot. The configured
+                // interval is the floor; above it, the gap stretches so that
+                // producing previews stays within its share of the run. A
+                // snapshot renders the entire image, so on a large one this is
+                // the difference between a tenth of the encode and half of it.
+                double min_gap = double(settings.preview_interval_ms) / 1000.0;
+                const double fraction = std::clamp(settings.preview_time_fraction, 0.01, 1.0);
+                if (fraction < 1.0)
+                    min_gap = std::max(min_gap, snapshot_seconds * (1.0 - fraction) / fraction);
+
+                const bool want_preview =
+                    settings.preview_interval_ms > 0 &&
+                    std::chrono::duration<double>(now - last_preview).count() >= min_gap;
+                if (want_preview || step == budget_steps || step % 32 == 0) {
+                    EncodeProgress p;
+                    p.step = step;
+                    p.max_steps = budget_steps;
+                    p.loss = loss;
+                    p.num_gaussians = cloud.count();
+                    p.elapsed_seconds = std::chrono::duration<double>(now - t_start).count();
+                    if (step > kWarmupSteps) {
+                        const double since_warmup =
+                            std::chrono::duration<double>(now - warmup_done).count();
+                        const double per_step = since_warmup / double(step - kWarmupSteps);
+                        p.estimated_total_seconds =
+                            p.elapsed_seconds + per_step * double(budget_steps - step);
+                    }
+                    if (!want_preview) {
+                        on_progress(p);
+                    } else {
+                        // Timed across the callback as well as the render. The
+                        // render is only half of what a preview costs: the
+                        // receiver still has to turn a planar float image into
+                        // something displayable, which at 12 megapixels is
+                        // another 48 MB of work. Budgeting for the render alone
+                        // would leave that half unaccounted for.
+                        const auto snap_start = clock::now();
+                        backend.snapshot(preview);
+                        p.preview = &preview;
+                        on_progress(p);
+                        snapshot_seconds =
+                            std::chrono::duration<double>(clock::now() - snap_start).count();
+                        last_preview = clock::now();
+                    }
+                }
+            }
+        }
+
+        // The loop leaves `step` one past the last one it ran when it ends
+        // normally, so the count reported to the caller is trimmed back to
+        // what was actually done. It matters more than it used to: with a
+        // budget, steps_run against steps_requested is how the interface knows
+        // to tell the user the run was shortened.
+        step = std::min(step, budget_steps);
+
+        backend.sync_cloud(cloud);
+        return backend.healthy(why);
+    };
+
+    // --- Backend selection, then the run, then the CPU retry if it went bad.
+    //
+    // Falling back before the first step (no GPU, shaders will not compile)
+    // was already handled. What was not, and is the failure a user actually
+    // sees, is a backend that starts fine and stops being correct partway
+    // through: there is no error dialog for that, only a file that will not
+    // open. The retry costs time on the machines that need it and nothing
+    // anywhere else.
+    const auto t_optimize = clock::now();
+    std::unique_ptr<ITrainBackend> backend;
+    if (settings.backend != Backend::Cpu) {
+        std::string why;
+        backend = g_gpu_factory_override ? g_gpu_factory_override(&why) : make_gpu_backend(&why);
+    }
+    bool ok = false;
+    if (backend) {
+        result.stats.backend_used = "gpu";
+        std::string why = "stopped responding";
+        ok = run_optimization(*backend, &why);
+        if (!ok && !result.cancelled) {
+            result.stats.gpu_fallback_reason = why;
+            backend.reset();   // release the GPU before the CPU run starts
+        }
+    }
+    if (!ok && !result.cancelled) {
         backend = std::make_unique<CpuBackend>();
         result.stats.backend_used = backend->name();
-        backend->prepare(*train_target, cloud, *stage);
-    }
-
-    // --- Optimization schedule.
-    const int adds_left_at_start = settings.progressive ? settings.add_times : 0;
-    const int add_interval =
-        adds_left_at_start > 0 ? std::max(32, max_steps * 2 / (5 * (adds_left_at_start + 1))) : 0;
-    int adds_left = adds_left_at_start;
-    const int per_add = adds_left > 0
-                            ? (n_total - cloud.count() + adds_left - 1) / adds_left
-                            : 0;
-
-    float lr_mult = 1.f;
-    int adam_t = 0;
-    Image preview;
-    auto last_preview = t_start;
-
-    const auto t_optimize = clock::now();
-    int step = 0;
-    for (step = 1; step <= max_steps; ++step) {
-        if (cancel && cancel->load(std::memory_order_relaxed)) {
-            result.cancelled = true;
-            break;
-        }
-        const float loss = backend->step(++adam_t, lr_mult);
-
-        // Progressive addition: place new gaussians where error is largest.
-        if (adds_left > 0 && step % add_interval == 0) {
-            GSIC_ZONE("add_gaussians");
-            const int add_n = std::min(per_add, n_total - cloud.count());
-            if (add_n > 0) {
-                const Image& tt = *train_target;
-                const std::int64_t tpixels = tt.pixels();
-                backend->sync_cloud(cloud);
-                Image recon;
-                backend->snapshot(recon);
-                // Error map (mean |diff| over channels, squared) with a 3x3
-                // blur so isolated noisy pixels don't dominate the sampling.
-                std::vector<float> err(size_t(tpixels), 0.f);
-                std::vector<float> diff(size_t(tpixels) * tt.c);
-                const float inv_c = 1.f / tt.c;
-                for (int c = 0; c < tt.c; ++c) {
-                    const float* r = recon.plane(c);
-                    const float* t = tt.plane(c);
-                    float* d = diff.data() + size_t(c) * tpixels;
-                    for (size_t i = 0, np = size_t(tpixels); i < np; ++i) {
-                        d[i] = t[i] - r[i];
-                        err[i] += std::fabs(d[i]) * inv_c;
-                    }
-                }
-                std::vector<float> err_blur(size_t(tpixels), 0.f);
-                for (int y = 0; y < tt.h; ++y)
-                    for (int x = 0; x < tt.w; ++x) {
-                        float s = 0.f;
-                        for (int dy = -1; dy <= 1; ++dy)
-                            for (int dx = -1; dx <= 1; ++dx)
-                                s += err[size_t(std::clamp(y + dy, 0, tt.h - 1)) * tt.w +
-                                         size_t(std::clamp(x + dx, 0, tt.w - 1))];
-                        err_blur[size_t(y) * tt.w + x] = s * s;  // squared like the paper
-                    }
-                std::vector<std::uint8_t> taken(size_t(tpixels), 0);
-                auto px = weighted_sample(err_blur, add_n, rng, taken);
-                // New gaussians take the residual as color so they immediately
-                // reduce the error they were placed on.
-                append_gaussians(cloud, tt, px, stage->init_scale_px, diff.data());
-                morton_sort(cloud);
-                backend->prepare(tt, cloud, *stage);
-                adam_t = 0;
-            }
-            --adds_left;
-        }
-
-        // Learning rate holds flat, then decays over the last stretch.
-        // Decaying earlier measurably hurts: gaussians keep migrating across
-        // the image for most of the run, and shrinking their steps too soon
-        // freezes them before they reach the detail they should cover. The
-        // final decay only settles what is already in place.
-        if (settings.lr_decay) {
-            const float progress = float(step) / float(max_steps);
-            if (progress > kLrDecayStart) {
-                const float t = (progress - kLrDecayStart) / (1.f - kLrDecayStart);
-                lr_mult = kLrFloor + (1.f - kLrFloor) * 0.5f *
-                                         (1.f + std::cos(std::numbers::pi_v<float> * t));
-            }
-        }
-
-        if (on_progress) {
-            const auto now = clock::now();
-            const bool want_preview =
-                settings.preview_interval_ms > 0 &&
-                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_preview).count() >=
-                    settings.preview_interval_ms;
-            if (want_preview || step == max_steps || step % 32 == 0) {
-                EncodeProgress p;
-                p.step = step;
-                p.max_steps = max_steps;
-                p.loss = loss;
-                p.num_gaussians = cloud.count();
-                if (want_preview) {
-                    backend->snapshot(preview);
-                    p.preview = &preview;
-                    last_preview = now;
-                }
-                on_progress(p);
-            }
+        std::string why;
+        if (!run_optimization(*backend, &why)) {
+            // The CPU path has no hardware to disagree with, so this means the
+            // input itself drove the optimizer to a non-finite state. Report
+            // it rather than writing a file nothing can open.
+            result.error = why.empty() ? "optimization failed" : why;
+            return result;
         }
     }
+    GaussianCloud& cloud = result.cloud;
 
     result.stats.optimize_seconds =
         std::chrono::duration<double>(clock::now() - t_optimize).count();
 
-    backend->sync_cloud(cloud);
-
     // Quantize exactly as the file stores it, then measure what a decoder
     // will actually see.
-    quantize_cloud(cloud, settings.quant);
+    if (!quantize_cloud(cloud, settings.quant)) {
+        result.error = "the encoded parameters could not be stored in the file format";
+        return result;
+    }
     result.file = encode_gsi(cloud, target.w, target.h, settings.quant);
+    // The encode is only finished when the bytes read back. Checking here
+    // costs one decode of a file that is already in memory and is the
+    // difference between "compression failed" and a .gsi on disk that nothing
+    // will open -- including this application.
+    if (result.file.empty() || !decode_gsi(result.file)) {
+        result.file.clear();
+        result.error = "the encoder produced a file that could not be read back";
+        return result;
+    }
     result.reconstruction = Renderer::render_image(cloud, target.w, target.h);
 
     result.stats.psnr = psnr(result.reconstruction, target);
     result.stats.ssim = ssim(result.reconstruction, target);
     result.stats.steps_run = std::min(step, max_steps);
+    result.stats.steps_requested = max_steps;
     result.stats.num_gaussians = cloud.count();
     result.stats.file_bytes = std::int64_t(result.file.size());
     result.stats.source_bytes = pixels * target.c;

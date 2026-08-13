@@ -35,13 +35,18 @@ static bool cpu_has_avx2_fma() {
 #endif
 
 const Kernels& kernels() {
-    static const Kernels& chosen = []() -> const Kernels& {
+    // Held as a pointer rather than a reference. Both referents have static
+    // storage duration, so a reference here is in fact safe, but GCC 13 cannot
+    // see that through the lambda and reports -Wdangling-reference. A warning
+    // that is always wrong is worse than no warning: it trains the reader to
+    // skim past this file. The pointer says the same thing without the noise.
+    static const Kernels* chosen = []() -> const Kernels* {
 #if defined(GSIC_HAVE_AVX2_TU)
-        if (cpu_has_avx2_fma()) return avx2::k;
+        if (cpu_has_avx2_fma()) return &avx2::k;
 #endif
-        return baseline::k;
+        return &baseline::k;
     }();
-    return chosen;
+    return *chosen;
 }
 
 } // namespace gsic

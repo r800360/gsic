@@ -49,7 +49,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build xorg-dev libwayland-dev \
-            libxkbcommon-dev libdbus-1-dev libltdl-dev autoconf-archive
+            libxkbcommon-dev libdbus-1-dev libltdl-dev autoconf-archive \
+            xvfb libgl1-mesa-dri
+          # The interface selftest needs a display and a GL implementation.
+          # Xvfb plus Mesa's software rasteriser provides both headlessly.
 
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
@@ -90,8 +93,33 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
 
+      # Runs all six suites: unit, regression, application pipeline,
+      # robustness, CLI end-to-end, and the interface selftest.
+      #
+      # These runners are worth more than their speed suggests. Every one of
+      # them has a different OpenGL implementation from any development
+      # machine -- Mesa's software rasteriser on Linux, a virtualised adapter
+      # on Windows, Apple's driver on macOS -- so the GPU self-check is
+      # exercised against implementations that genuinely differ, which is the
+      # variation that shipped a broken build in the first place.
       - name: Test
+        if: runner.os != 'Linux'
         run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      - name: Test (Linux, under a virtual display)
+        if: runner.os == 'Linux'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+        run: xvfb-run -a ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      # A record, per platform, of which backend the self-check accepted. Not
+      # a pass/fail gate: both answers are correct, and knowing which one each
+      # environment reached is what makes a later "it works here" meaningful.
+      - name: Report the compute backend this platform chose
+        shell: bash
+        run: |
+          bin="build/${{ matrix.preset }}"
+          "$bin/gsic" bench --preset fast 2>&1 | sed -n '1,4p' || true
 
   report:
     name: Build report PDF

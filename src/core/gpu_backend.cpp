@@ -20,8 +20,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gsic {
@@ -345,6 +348,14 @@ void main() {
 struct GpuContext {
     GLFWwindow* window = nullptr;
     bool ready = false;
+    // Set once the self-check has ruled this machine's GPU out. Without it
+    // every encode would re-run the check, and on a machine that fails it the
+    // check is exactly the work that does not pay off.
+    bool checked_and_rejected = false;
+    // The thread that created the context. See gpu_init: everything else may
+    // use the context, but only this thread may bring it into existence.
+    std::thread::id owner;
+    bool owner_valid = false;
     std::string fail_reason = "not initialized";
     std::mutex use_mutex;   // one training job at a time
     GLuint prog_project = 0, prog_scan = 0, prog_fill = 0, prog_forward = 0;
@@ -407,8 +418,14 @@ public:
 
     const char* name() const override { return "gpu"; }
 
+    bool healthy(std::string* why) const override {
+        if (!healthy_ && why) *why = fail_reason_;
+        return healthy_;
+    }
+
     bool prepare(const Image& target, GaussianCloud& cloud, const EncodeSettings& s) override {
         GSIC_ZONE("gpu_prepare");
+        if (!healthy_) return false;
         glfwMakeContextCurrent(ctx().window);
         while (glGetError() != GL_NO_ERROR) {}  // drain stale errors
         target_ = &target;
@@ -455,14 +472,19 @@ public:
         alloc(kLossOut, 8);
         const GLenum err = glGetError();
         glfwMakeContextCurrent(nullptr);
-        if (err != GL_NO_ERROR)
-            std::fprintf(stderr, "gsic: GPU buffer setup failed (GL error 0x%x); using CPU\n",
-                         err);
-        return err == GL_NO_ERROR;
+        if (err != GL_NO_ERROR) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "could not allocate GPU buffers (GL error 0x%x)",
+                          unsigned(err));
+            mark_failed(buf);
+            return false;
+        }
+        return true;
     }
 
     float step(int t, float lr_mult) override {
         GSIC_ZONE("gpu_step");
+        if (!healthy_) return std::numeric_limits<float>::quiet_NaN();
         glfwMakeContextCurrent(ctx().window);
         auto& c = ctx();
         const auto barrier = [] { glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT); };
@@ -553,7 +575,22 @@ public:
             item_capacity_ *= 2;
             alloc(kItems, item_capacity_ * 4);
         }
+
+        // The whole step is checked once, here. Every dispatch above can fail
+        // for reasons that vary by driver and by how much memory the machine
+        // has left -- an out-of-memory buffer resize is the likely one on an
+        // integrated GPU sharing system RAM -- and none of them stop the
+        // sequence on their own. Without this the run continues on stale
+        // buffers and the only evidence is a bad image at the end.
+        const GLenum err = glGetError();
         glfwMakeContextCurrent(nullptr);
+        if (err != GL_NO_ERROR) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "GL error 0x%x during optimization",
+                          unsigned(err));
+            mark_failed(buf);
+            return std::numeric_limits<float>::quiet_NaN();
+        }
         return loss[0] / (float(w_) * float(h_) * float(c_));
     }
 
@@ -631,6 +668,16 @@ private:
         glDispatchCompute(GLuint(gx), GLuint(gy), 1);
     }
 
+    void mark_failed(const char* why) {
+        if (healthy_) {
+            healthy_ = false;
+            fail_reason_ = why;
+            std::fprintf(stderr, "gsic: GPU backend %s; redoing this image on the CPU\n", why);
+        }
+    }
+
+    bool healthy_ = true;
+    std::string fail_reason_;
     std::unique_lock<std::mutex> lock_;
     const Image* target_ = nullptr;
     GaussianCloud* cloud_ = nullptr;
@@ -643,11 +690,144 @@ private:
     float sinv_lo_ = 0.f, sinv_hi_ = 1.f;
 };
 
+// --------------------------------------------------------------- self-check
+//
+// Compiling eight compute shaders proves the driver accepts the source. It
+// does not prove the driver runs it correctly, and that gap is where the
+// interesting failures live: the shaders here lean on shared-memory
+// reductions, barriers in loops whose bounds come from a buffer, and atomics
+// into a tile list, all of which are places where implementations differ in
+// practice even though the specification does not.
+//
+// So before the GPU is allowed to encode anything a user cares about, it
+// solves a miniature of the same problem and its answer is compared against
+// the CPU's. A machine whose GPU disagrees here is not slower, it is wrong,
+// and it spends the rest of the session on the CPU. The check is deliberately
+// tiny -- a 64x48 image and eight steps -- because it runs at every start.
+//
+// The tolerance has to admit one real difference: the CPU kernels approximate
+// exp() with a degree-4 polynomial (~1e-4 relative), while the shaders call
+// the hardware's. Everything larger than that is a disagreement about the
+// math, not about rounding.
+bool gpu_agrees_with_cpu(std::string* why) {
+    constexpr int kW = 64, kH = 48, kC = 3;
+    constexpr int kSteps = 8;
+    constexpr double kLossTolerance = 0.02;   // relative
+    constexpr double kParamTolerance = 0.02;  // absolute, after kSteps of Adam
+
+    auto explain = [&](const std::string& msg) {
+        if (why) *why = msg;
+        return false;
+    };
+
+    // A fixed target and a fixed cloud: no RNG, so every machine runs the
+    // identical problem and a failure here is always reproducible.
+    Image target(kW, kH, kC);
+    for (int ch = 0; ch < kC; ++ch) {
+        float* p = target.plane(ch);
+        for (int y = 0; y < kH; ++y)
+            for (int x = 0; x < kW; ++x)
+                p[size_t(y) * kW + x] =
+                    0.5f + 0.35f * std::sin(0.11f * float(x) + 0.7f * float(ch)) *
+                               std::cos(0.09f * float(y));
+    }
+    GaussianCloud base;
+    base.channels = kC;
+    base.resize(96);
+    for (int i = 0; i < base.count(); ++i) {
+        const float t = float(i) / float(base.count());
+        base.pos_x[i] = 0.05f + 0.9f * std::fmod(t * 7.f, 1.f);
+        base.pos_y[i] = 0.05f + 0.9f * std::fmod(t * 3.f, 1.f);
+        base.sinv_x[i] = 1.f / (3.f + 4.f * std::fmod(t * 5.f, 1.f));
+        base.sinv_y[i] = 1.f / (3.f + 4.f * std::fmod(t * 2.f, 1.f));
+        base.rot[i] = 3.1f * t;
+        for (int ch = 0; ch < kC; ++ch)
+            base.color[size_t(i) * kC + ch] = 0.2f + 0.6f * std::fmod(t * (ch + 2.f), 1.f);
+    }
+
+    EncodeSettings s;
+    s.preview_interval_ms = 0;
+    GaussianCloud cpu_cloud = base, gpu_cloud = base;
+
+    auto cpu = make_cpu_backend();
+    GpuBackend gpu{std::unique_lock<std::mutex>(ctx().use_mutex)};
+    if (!cpu->prepare(target, cpu_cloud, s)) return explain("CPU reference backend failed");
+    if (!gpu.prepare(target, gpu_cloud, s)) {
+        std::string reason = "buffer setup failed";
+        gpu.healthy(&reason);
+        return explain(reason);
+    }
+
+    for (int t = 1; t <= kSteps; ++t) {
+        const float lc = cpu->step(t, 1.f);
+        const float lg = gpu.step(t, 1.f);
+        if (!std::isfinite(lg)) {
+            std::string reason = "returned a non-finite loss";
+            gpu.healthy(&reason);
+            return explain(reason);
+        }
+        const double rel = std::fabs(double(lc) - double(lg)) / std::max(1e-9, double(lc));
+        if (rel > kLossTolerance) {
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "loss disagrees with the CPU at step %d (%.6f vs %.6f)", t, double(lg),
+                          double(lc));
+            return explain(buf);
+        }
+    }
+
+    gpu.sync_cloud(gpu_cloud);
+    struct Group { const char* name; const std::vector<float>* a; const std::vector<float>* b; };
+    const Group groups[] = {
+        {"position", &cpu_cloud.pos_x, &gpu_cloud.pos_x},
+        {"position", &cpu_cloud.pos_y, &gpu_cloud.pos_y},
+        {"scale", &cpu_cloud.sinv_x, &gpu_cloud.sinv_x},
+        {"scale", &cpu_cloud.sinv_y, &gpu_cloud.sinv_y},
+        {"rotation", &cpu_cloud.rot, &gpu_cloud.rot},
+        {"color", &cpu_cloud.color, &gpu_cloud.color},
+    };
+    for (const Group& g : groups) {
+        for (size_t i = 0; i < g.a->size(); ++i) {
+            const double d = std::fabs(double((*g.a)[i]) - double((*g.b)[i]));
+            if (!std::isfinite((*g.b)[i]) || d > kParamTolerance) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "%s parameters disagree with the CPU (%.5f vs %.5f)", g.name,
+                              double((*g.b)[i]), double((*g.a)[i]));
+                return explain(buf);
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool gpu_init(std::string* why_not) {
     auto& c = ctx();
     if (c.ready) return true;
+    if (c.checked_and_rejected) {
+        if (why_not) *why_not = c.fail_reason;
+        return false;
+    }
+    // The context, and the hidden window carrying it, belong to whichever
+    // thread creates them: on Windows that window's message queue lives on
+    // that thread, and when the thread exits the queue goes with it. A later
+    // glfwMakeContextCurrent on the orphaned window then blocks forever.
+    //
+    // That is not hypothetical. Creating it lazily from an encoding worker
+    // used to work perfectly for the first image and hang on the second, at
+    // one core, with the interface still responding -- an application that
+    // accepted your file and will not finish it, which is exactly the
+    // complaint this release exists to answer. So the owner is recorded here
+    // and nobody else gets to create it.
+    if (c.owner_valid && c.owner != std::this_thread::get_id()) {
+        if (why_not)
+            *why_not = "the GPU context belongs to another thread; call gpu_init() at startup";
+        return false;
+    }
+    c.owner = std::this_thread::get_id();
+    c.owner_valid = true;
 #if defined(__APPLE__)
     c.fail_reason = "macOS has no OpenGL compute support";
     if (why_not) *why_not = c.fail_reason;
@@ -701,7 +881,19 @@ bool gpu_init(std::string* why_not) {
         }
     }
     glfwMakeContextCurrent(nullptr);
+
+    // Provisionally ready, so the self-check can drive the real backend, then
+    // confirmed or withdrawn by the result.
     c.ready = true;
+    std::string why;
+    if (!gpu_agrees_with_cpu(&why)) {
+        c.ready = false;
+        c.checked_and_rejected = true;
+        c.fail_reason = "GPU self-check failed: " + why;
+        std::fprintf(stderr, "gsic: %s; using the CPU backend instead\n", c.fail_reason.c_str());
+        if (why_not) *why_not = c.fail_reason;
+        return false;
+    }
     return true;
 #endif
 }
@@ -713,13 +905,17 @@ void gpu_shutdown() {
         c.window = nullptr;
     }
     c.ready = false;
+    c.checked_and_rejected = false;
     c.fail_reason = "shut down";
 }
 
 std::optional<Image> gpu_render(const GaussianCloud& cloud, int w, int h, std::string* error) {
     GSIC_ZONE("gpu_render");
     auto& c = ctx();
-    if (!c.ready && !gpu_init(error)) return std::nullopt;
+    if (!c.ready) {   // same reasoning as make_gpu_backend
+        if (error) *error = c.fail_reason;
+        return std::nullopt;
+    }
     std::unique_lock lock(c.use_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         if (error) *error = "GPU busy";
@@ -833,7 +1029,15 @@ std::optional<Image> gpu_render(const GaussianCloud& cloud, int w, int h, std::s
 
 std::unique_ptr<ITrainBackend> make_gpu_backend(std::string* why_not) {
     auto& c = ctx();
-    if (!c.ready && !gpu_init(why_not)) return nullptr;
+    // Deliberately not initializing here. This runs on whichever thread is
+    // encoding, and creating the context off the thread that owns it is the
+    // hang described in gpu_init. Callers that want the GPU ask for it once,
+    // at startup, from the thread that will outlive every encode; anyone who
+    // did not gets the CPU, which is a correct answer rather than a stall.
+    if (!c.ready) {
+        if (why_not) *why_not = c.fail_reason;
+        return nullptr;
+    }
     std::unique_lock lock(c.use_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         if (why_not) *why_not = "GPU busy with another job";

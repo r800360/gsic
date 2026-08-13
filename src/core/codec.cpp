@@ -66,9 +66,20 @@ private:
 };
 
 // ------------------------------------------------------- scalar quantizers
+//
+// Every quantizer here has to be total: it is handed whatever the optimizer
+// finished with, and on some hardware that can include a NaN or an infinity.
+// std::clamp passes those straight through (both comparisons are false), and
+// converting one to an integer is undefined behaviour, so the guard is not
+// decoration. A poisoned value becomes level zero, which is meaningless but
+// finite; the encoder above still refuses to ship the result, and this only
+// guarantees it can never be the thing that crashes or writes an unopenable
+// file on the way there.
 inline std::uint32_t quantize(float v, float lo, float hi, std::uint32_t levels) {
+    if (!std::isfinite(v)) return 0;
     const float t = (std::clamp(v, lo, hi) - lo) / (hi - lo);
-    return std::uint32_t(t * float(levels) + 0.5f);
+    if (!std::isfinite(t)) return 0;
+    return std::uint32_t(std::clamp(t, 0.f, 1.f) * float(levels) + 0.5f);
 }
 
 inline float dequantize(std::uint32_t q, float lo, float hi, std::uint32_t levels) {
@@ -105,9 +116,22 @@ struct Reader {
     float f32() { return std::bit_cast<float>(u32()); }
 };
 
+// The range written into the header, over the finite values only. A single
+// NaN reaching the header is fatal in a way that is easy to miss: the header
+// stores it verbatim, and decode_gsi correctly rejects a non-finite range, so
+// the encoder would produce a file that its own decoder refuses to open.
+// Skipping non-finite values here keeps the header well formed no matter what
+// the optimizer produced.
 void min_max(const float* v, size_t n, float& lo, float& hi) {
-    lo = v[0]; hi = v[0];
-    for (size_t i = 1; i < n; ++i) { lo = std::min(lo, v[i]); hi = std::max(hi, v[i]); }
+    bool any = false;
+    lo = 0.f;
+    hi = 0.f;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(v[i])) continue;
+        if (!any) { lo = hi = v[i]; any = true; continue; }
+        lo = std::min(lo, v[i]);
+        hi = std::max(hi, v[i]);
+    }
     if (!(hi > lo)) hi = lo + 1e-6f;  // degenerate range: keep the divide safe
 }
 
@@ -121,6 +145,13 @@ std::vector<std::uint8_t> encode_gsi(const GaussianCloud& cloud, int width, int 
                                      const QuantSpec& quant) {
     const int n = cloud.count();
     const int c = cloud.channels;
+    // Anything decode_gsi would refuse is not worth writing. Returning nothing
+    // makes the failure visible to the caller instead of handing it bytes that
+    // only fail later, in someone else's hands.
+    if (n <= 0 || n > kMaxGaussians || c < 1 || c > kMaxChannels || !quant.valid()) return {};
+    if (width <= 0 || height <= 0 || width > kMaxDimension || height > kMaxDimension ||
+        std::int64_t(width) * std::int64_t(height) > kMaxPixels)
+        return {};
 
     // Scales quantize in log space: their distribution is heavily skewed
     // toward small inverse scales, and log spacing matches perceptual impact.
@@ -195,10 +226,19 @@ std::vector<std::uint8_t> encode_gsi(const GaussianCloud& cloud, int width, int 
                    quant.feat);
     bw.flush();
 
+    // Entropy coding is an optimization, not a requirement of the format, so
+    // a zstd failure stores the payload verbatim rather than emitting a file
+    // with an empty compressed block that nothing can decode. The flag byte
+    // written into the header already distinguishes the two cases.
     std::vector<std::uint8_t> compressed(ZSTD_compressBound(raw.size()));
-    const size_t csize = ZSTD_compress(compressed.data(), compressed.size(),
-                                       raw.data(), raw.size(), 19);
-    compressed.resize(ZSTD_isError(csize) ? 0 : csize);
+    const size_t csize =
+        ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), 19);
+    const bool zstd_ok = !ZSTD_isError(csize);
+    if (zstd_ok)
+        compressed.resize(csize);
+    else
+        compressed = raw;
+    w.bytes[6] = zstd_ok ? kFlagZstd : 0;   // flags byte, written above
 
     w.u32(std::uint32_t(raw.size()));
     w.u32(std::uint32_t(compressed.size()));
@@ -296,11 +336,13 @@ std::optional<GsiFile> decode_gsi(std::span<const std::uint8_t> bytes, std::stri
     return file;
 }
 
-void quantize_cloud(GaussianCloud& cloud, const QuantSpec& quant) {
+bool quantize_cloud(GaussianCloud& cloud, const QuantSpec& quant) {
     // Roundtrip through the exact encode/decode transforms.
     auto bytes = encode_gsi(cloud, 1, 1, quant);
     auto file = decode_gsi(bytes);
-    if (file) cloud = std::move(file->cloud);
+    if (!file) return false;
+    cloud = std::move(file->cloud);
+    return true;
 }
 
 } // namespace gsic

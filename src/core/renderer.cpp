@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace gsic {
 
@@ -123,6 +124,61 @@ Image Renderer::render_image(const GaussianCloud& cloud, int w, int h) {
     for (int c = 0; c < cloud.channels; ++c) planes[c] = out.plane(c);
     r.render(cloud, planes);
     return out;
+}
+
+// ------------------------------------------------------------ scaled decode
+//
+// One implementation, shared by the command line tool and the desktop app.
+// It used to live only inside the CLI's decompress command, which meant the
+// window had no way to offer the same thing and the range checking existed in
+// exactly one caller. A scale arriving from a text box is untrusted input in
+// the same sense a file is: 100x on a 4K image asks for 16 gigapixels, and the
+// honest answer is a message, not an allocation failure.
+std::optional<ScaledDecode> scale_gsi(const GsiFile& file, float scale, std::string* error) {
+    const auto fail = [&](const std::string& msg) -> std::optional<ScaledDecode> {
+        if (error) *error = msg;
+        return std::nullopt;
+    };
+    if (file.width <= 0 || file.height <= 0) return fail("the file has no usable size");
+    if (!(scale > 0.f) || !std::isfinite(scale)) return fail("the scale must be a positive number");
+    if (scale < kMinDecodeScale || scale > kMaxDecodeScale) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "the scale must be between %.2fx and %.0fx",
+                      double(kMinDecodeScale), double(kMaxDecodeScale));
+        return fail(buf);
+    }
+
+    ScaledDecode out;
+    out.scale = scale;
+    out.w = std::max(1, int(float(file.width) * scale + 0.5f));
+    out.h = std::max(1, int(float(file.height) * scale + 0.5f));
+    if (out.w > kMaxDimension || out.h > kMaxDimension ||
+        std::int64_t(out.w) * std::int64_t(out.h) > kMaxPixels) {
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "%.2fx would decode to %dx%d, past this build's limit of %lld pixels "
+                      "and %d per side",
+                      double(scale), out.w, out.h, static_cast<long long>(kMaxPixels),
+                      kMaxDimension);
+        return fail(buf);
+    }
+
+    out.cloud = file.cloud;
+    if (out.w != file.width || out.h != file.height) {
+        // Gaussian sizes are stored in pixels, so they have to grow with the
+        // output or a 2x decode renders the same picture with half-size
+        // splats. Positions are normalized and need no adjustment.
+        const float ratio = float(out.w) / float(file.width);
+        for (auto& v : out.cloud.sinv_x) v /= ratio;
+        for (auto& v : out.cloud.sinv_y) v /= ratio;
+    }
+    return out;
+}
+
+Image render_gsi(const GsiFile& file, float scale, std::string* error) {
+    auto scaled = scale_gsi(file, scale, error);
+    if (!scaled) return {};
+    return Renderer::render_image(scaled->cloud, scaled->w, scaled->h);
 }
 
 } // namespace gsic

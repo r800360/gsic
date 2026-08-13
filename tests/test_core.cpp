@@ -8,10 +8,13 @@
 #include "core/renderer.h"
 #include "core/trainer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace gsic;
@@ -188,6 +191,83 @@ void test_codec_rejects_garbage() {
     }
 }
 
+// Decoding at a size the file was never stored at. This is the whole reason
+// the format is worth having over a raster one, and it is now one
+// implementation shared by the command line tool and the window rather than
+// arithmetic copied into each. That matters most for the checking: a scale
+// arriving from a text box is untrusted input in the same sense a file is, and
+// 5000x on a 2K image asks for a hundred gigapixels.
+void test_scaled_decode() {
+    std::mt19937 rng(29);
+    GaussianCloud cloud = random_cloud(200, 3, rng);
+    auto bytes = encode_gsi(cloud, 320, 240, QuantSpec{});
+    auto file = decode_gsi(bytes);
+    CHECK(file.has_value());
+    if (!file) return;
+
+    // At the stored size nothing is touched.
+    auto same = scale_gsi(*file, 1.f);
+    CHECK(same.has_value());
+    if (same) {
+        CHECK(same->w == 320 && same->h == 240);
+        for (int i = 0; i < same->cloud.count(); ++i)
+            CHECK_NEAR(same->cloud.sinv_x[i], file->cloud.sinv_x[i], 1e-6);
+    }
+
+    // Larger and smaller: the output size follows, and gaussian sizes are
+    // scaled with it. Leaving sinv alone would render the same picture with
+    // half-size splats -- a 2x decode of dots on a grey field.
+    for (float s : {0.5f, 2.f, 3.25f}) {
+        std::string err;
+        auto scaled = scale_gsi(*file, s, &err);
+        CHECK(scaled.has_value());
+        if (!scaled) {
+            std::printf("  scale %.2f refused: %s\n", double(s), err.c_str());
+            continue;
+        }
+        CHECK(scaled->w == std::max(1, int(320 * s + 0.5f)));
+        CHECK(scaled->h == std::max(1, int(240 * s + 0.5f)));
+        const float ratio = float(scaled->w) / 320.f;
+        for (int i = 0; i < scaled->cloud.count(); ++i) {
+            CHECK_NEAR(scaled->cloud.sinv_x[i], file->cloud.sinv_x[i] / ratio, 1e-5);
+            CHECK_NEAR(scaled->cloud.sinv_y[i], file->cloud.sinv_y[i] / ratio, 1e-5);
+        }
+        // Positions are normalized, so they must not move.
+        for (int i = 0; i < scaled->cloud.count(); ++i)
+            CHECK_NEAR(scaled->cloud.pos_x[i], file->cloud.pos_x[i], 1e-6);
+    }
+
+    // Everything out of range comes back as a message, before any allocation.
+    for (float bad : {0.f, -1.f, 1e9f, kMaxDecodeScale * 2.f, kMinDecodeScale * 0.5f}) {
+        std::string err;
+        CHECK(!scale_gsi(*file, bad, &err).has_value());
+        CHECK(!err.empty());
+    }
+    {
+        std::string err;
+        CHECK(!scale_gsi(*file, std::numeric_limits<float>::quiet_NaN(), &err).has_value());
+        CHECK(!err.empty());
+    }
+    // A scale inside the offered range that would still exceed the build's
+    // pixel ceiling is refused for that reason instead of being attempted.
+    {
+        GsiFile huge = *file;
+        huge.width = kMaxDimension;
+        huge.height = kMaxDimension;
+        std::string err;
+        CHECK(!scale_gsi(huge, kMaxDecodeScale, &err).has_value());
+        CHECK(!err.empty());
+    }
+
+    // And the convenience wrapper produces an image of exactly that size.
+    Image rendered = render_gsi(*file, 2.f);
+    CHECK(rendered.w == 640 && rendered.h == 480 && rendered.c == 3);
+    std::string err;
+    Image refused = render_gsi(*file, 0.f, &err);
+    CHECK(refused.empty());
+    CHECK(!err.empty());
+}
+
 // The size caps are the guard against size_t overflow on 32-bit builds and
 // against an untrusted file driving a huge allocation. Both must hold.
 void test_size_limits() {
@@ -348,9 +428,18 @@ void test_gpu_render_matches_cpu() {
 } // namespace
 
 int main() {
+    // From the main thread, once, before anything asks for a GPU backend:
+    // the context may only be created by a thread that outlives every use of
+    // it (see gpu.h). Tests that need it find it ready; if there is none, the
+    // GPU-dependent cases below skip themselves.
+    {
+        std::string why;
+        if (!gpu_init(&why)) std::printf("  (no GPU available: %s)\n", why.c_str());
+    }
     test_gradients();
     test_codec_roundtrip();
     test_codec_rejects_garbage();
+    test_scaled_decode();
     test_size_limits();
     test_metrics();
     test_renderer_basic();

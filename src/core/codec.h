@@ -43,6 +43,11 @@ std::int64_t payload_bits(int n, int channels, const QuantSpec& q);
 
 // Serializes to the .gsi format: quantized parameter planes (scale in log
 // domain, rotation wrapped to [0, pi)) packed tightly and zstd-compressed.
+//
+// Guarantees that whatever it returns non-empty, decode_gsi accepts. Anything
+// it cannot represent that way -- an empty cloud, dimensions past the build's
+// limits, parameters the optimizer left non-finite -- comes back as an empty
+// vector instead of bytes that fail in a decoder somewhere else.
 std::vector<std::uint8_t> encode_gsi(const GaussianCloud& cloud, int width, int height,
                                      const QuantSpec& quant);
 
@@ -52,7 +57,9 @@ std::optional<GsiFile> decode_gsi(std::span<const std::uint8_t> bytes, std::stri
 
 // In-place quantize/dequantize of cloud parameters, exactly matching what the
 // file roundtrip produces. Called before final quality measurement so the
-// reported PSNR reflects the decoded file.
-void quantize_cloud(GaussianCloud& cloud, const QuantSpec& quant);
+// reported PSNR reflects the decoded file. False means the roundtrip did not
+// survive, in which case the cloud is left untouched and the caller must not
+// treat the reported quality as describing the file.
+bool quantize_cloud(GaussianCloud& cloud, const QuantSpec& quant);
 
 } // namespace gsic

@@ -1,6 +1,6 @@
 {
   "name": "gsic",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Gaussian splat image compressor: content-adaptive image compression with 2D Gaussians.",
   "builtin-baseline": "39344dff01c5a5a0134caf2624cdd492f05d30ea",
   "dependencies": [
