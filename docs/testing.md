@@ -9,7 +9,7 @@ targets so a failure says which layer broke.
 | --- | --- |
 | `core` | Analytic gradients against numerical finite differences, codec round trip, scaled decode, hostile input, size limits, renderer symmetry, CPU/GPU agreement |
 | `regression` | Quality and file-size baselines per content type, determinism, decode fidelity, rescaled decode |
-| `app` | The desktop app's queue: compressing, opening a `.gsi`, exporting, comparing, remembered settings — driven the way a user drives them |
+| `app` | The desktop app's queue: compressing, opening a `.gsi`, exporting, comparing, remembered settings |
 | `robustness` | The failure paths that only appear on other people's hardware |
 | `cli` | The shipped executable: compress, decompress, info, compare, batch, and every failure path |
 | `gui` | Starts the real window and GL context, reads the rendered frame back, compresses an image, then reopens the file it just wrote |
@@ -42,7 +42,7 @@ They are simply never painted. So the selftest starts the real window, renders
 differs from the clear colour.
 
 It then compresses an image through the real pipeline and requires the
-resulting file to decode — and then **opens that file the way a user would**,
+resulting file to decode and then **opens that file the way a user would**,
 checking it comes back as something to look at, at the size it was written, with
 pixels to show. That last step is the path the Store package's file association
 has always advertised: before it existed, double-clicking a `.gsi` in Explorer
@@ -50,7 +50,7 @@ started the application and told the user their own file "could not be read as
 an image".
 
 All of this runs in the shipped binary, on whatever hardware it finds, after
-the GPU self-check has chosen a backend — which is the combination that
+the GPU self-check has chosen a backend, which is the combination that
 actually gets installed.
 
 ## `app` answers "does adding a file produce a result"
@@ -66,17 +66,17 @@ no GL context, on every platform.
 It covers the whole life of a compressed file, not just its creation:
 
 - compress an image, throw the pipeline away, and open the `.gsi` with a fresh
-  one — which is what a second launch of the application is
+  one
 - the intake decision, by extension and by the four magic bytes, so a renamed
   `.gsi` still opens and a renamed `.png` is still refused with a reason
 - decoding at another size, and refusing a scale that would ask for more pixels
   than the build can address
 - exporting a `.png` at 1× and 2×, and reading it back
 - damaged input: truncated, corrupt, empty, and an ordinary PNG wearing the
-  extension — each must end in a sentence, not a crash
+  extension
 - measuring a decoded file against its original, and comparing two images
 - changing the settings and running the same entry again: the new values have
-  to reach the encoder, or the button appears to do nothing — and a run the
+  to reach the encoder, or the button appears to do nothing, and a run that the
   clock cut short has to be distinguishable from one that simply finished, or
   the interface cannot know to offer a longer limit
 - running a whole batch again at a different preset, reusing the same entries
@@ -100,8 +100,8 @@ path.
 
 Every one of these was validated by injecting a known regression and confirming
 it fails. A test that has never failed has not been tested. For the record,
-with the mid-encode fallback removed, a backend that stops being correct at step
-40 of 240 produces **14.54 dB where the CPU produces 37.67 dB** — and the old
+with the mid-encode fallback removed, a backend that stopped being correct at step
+40 of 240 produced **14.54 dB where the CPU produced 37.67 dB**, and the old
 code wrote that file out without a word.
 
 The same was done for the newer cases: routing `.gsi` files back to the image
@@ -153,9 +153,9 @@ happened.
   says where.
 
 Files are written to a neighbouring temporary name and moved into place, so a
-write that dies partway — a full disk, a removed drive — cannot leave a
-truncated file where a valid one should be. This applies to the `.gsi`, to
-exported `.png` files, and to the settings file.
+write that dies partway cannot leave a truncated file where a valid one should
+be. This applies to the `.gsi`, to exported `.png` files, and to the settings
+file.
 
 ### Untrusted input
 

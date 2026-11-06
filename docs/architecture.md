@@ -57,8 +57,8 @@ src/app/
 tests/          the six suites
 ```
 
-`src/app/pipeline.cpp` holds one queue with three kinds of entry — compress an
-image, open a `.gsi`, compare two images — sharing one worker, one status model
+`src/app/pipeline.cpp` holds one queue with three kinds of entry (compress an
+image, open a `.gsi`, compare two images) sharing one worker, one status model
 and one preview representation. That split is deliberate: it is the code path a
 user exercises when they add a file and expect something to happen, and while
 it was tangled up with the interface there was no way to test it. It now has no
@@ -169,7 +169,7 @@ window's message queue belongs to the thread that created it; when that thread
 exits, operations on the window block rather than fail.
 
 The context used to be created lazily by whichever thread first wanted a GPU
-backend — an encoding worker. Measured: the first image compressed correctly in
+backend as an encoding worker. Measured: the first image compressed correctly in
 8.2 s, and the second, identical, never finished. One core busy, no error, no
 progress, the interface still responding to clicks.
 

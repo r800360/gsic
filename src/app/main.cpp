@@ -1,6 +1,7 @@
 #include "app.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -56,6 +57,10 @@ int main(int argc, char** argv) {
             options.selftest = true;
         else if (arg == "--screenshot" && i + 1 < argc)
             options.screenshot = argv[++i];
+        else if (arg == "--screenshot-at" && i + 1 < argc)
+            options.screenshot_at = std::atof(argv[++i]);
+        else if (arg == "--settings" && i + 1 < argc)
+            options.settings_file = argv[++i];
         else
             files.emplace_back(arg);
     }

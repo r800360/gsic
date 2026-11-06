@@ -138,15 +138,48 @@ cmake --build build/<preset> --target logo
 
 Commit the generated files after changing the mark.
 
-Screenshots of the interface come from the application itself rather than from
-a screen-capture tool, so they are reproducible and can be regenerated after a
-change to the layout:
+The four 1920x1080 Store screenshots, and the poster, box and hero art, are
+produced rather than drawn by hand, so they can be regenerated after any
+change to the layout or the mark.
 
-```bash
-gsic-gui --borderless photo.png --screenshot shot.png
-```
+The art comes from the `logo` target along with the icon and the package
+assets, and lands in `packaging/store/`. The screenshots are captures of the
+real interface driven by a script that lives outside the repository; the flags
+it uses are below, and they are enough to reproduce it.
 
-`--borderless` makes the client area exactly fill the primary monitor.
-`--screenshot` waits for the queue to drain, writes what the window looks like,
-and exits; any files named on the command line are processed first, so the
-capture shows a finished result rather than an empty queue.
+The flags it drives are worth knowing separately:
+
+| Flag | Does |
+| --- | --- |
+| `--borderless` | Opens an undecorated window the size of the primary monitor |
+| `--screenshot <file>` | Writes what the window looks like, then exits |
+| `--screenshot-at <seconds>` | Captures on a clock rather than waiting for the queue to drain |
+| `--settings <file>` | Uses that settings file instead of the per-user one, for reading and writing |
+
+`--screenshot` reads the window's own framebuffer. That is not fussiness about
+fidelity; it is the only method that works here. `PrintWindow` returns the
+window's redirection surface, which an OpenGL window never paints into, so it
+hands back the frame from the moment the window was last resized. A screen grab
+works for an ordinary window and fails for this one, because an undecorated
+window exactly covering the monitor is presented independently of the desktop
+composition and the desktop DC holds nothing of it. Both were tried first and
+both produced screenshots of the wrong moment.
+
+`--settings` is also the flag for running a portable copy with its preferences
+beside the executable instead of in the user's profile.
+
+## Releasing an update
+
+Store submissions cannot reuse a version number, so bump it before packaging.
+It appears in four places and all four have to agree:
+
+| File | Form |
+| --- | --- |
+| `CMakeLists.txt` | `project(gsic VERSION 1.1.0 ...)` |
+| `src/app/windows.rc` | `1,1,0,0` and `"1.1.0"`, twice each |
+| `packaging/msix/AppxManifest.xml` | `Version="1.1.0.0"` (the fourth component stays 0) |
+| `src/app/app.cpp` | the `GSIC_VERSION` fallback, used only if the build does not define it |
+
+Both executables are given `GSIC_VERSION` from the project version, so
+`gsic diagnose`, the About box and the first line of the log all report the
+build they came from.

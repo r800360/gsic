@@ -32,6 +32,20 @@ struct AppOptions {
     // hand -- produces a different image every time and cannot be part of a
     // build. It is also the only way to look at the interface from a script.
     std::filesystem::path screenshot;
+    // When greater than zero, capture this many seconds after the window
+    // opens instead of waiting for the queue to drain. A picture of the
+    // application working -- a queue part way through, with the estimate of
+    // what is left -- is one the listing needs and the other trigger can
+    // never produce, because by the time it fires there is nothing left to
+    // show.
+    double screenshot_at = 0.0;
+    // Use this settings file instead of the per-user one, for both reading
+    // and writing. Named explicitly, so it is deterministic in the way the
+    // per-user file is not -- which is why the scripted modes, which ignore
+    // the per-user file precisely to stay reproducible, still honour this
+    // one. Also what to point at to keep a portable copy's preferences
+    // beside it rather than in the user's profile.
+    std::filesystem::path settings_file;
 };
 
 // Runs the GUI application; returns the process exit code. Paths given on

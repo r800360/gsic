@@ -12,6 +12,7 @@
 
 #include "pipeline.h"
 #include "settings.h"
+#include "view.h"
 
 #include "core/codec.h"
 #include "core/gpu.h"
@@ -1285,6 +1286,49 @@ void test_an_unlimited_run_is_never_reported_as_cut_short() {
     std::puts("  an encode with no limit is not blamed on the clock");
 }
 
+
+// Zooming has to keep whatever is under the pointer under the pointer. It did
+// not: the arithmetic used the new scale's centred base on both sides of the
+// subtraction, so every wheel click slid the picture by half the change in its
+// on-screen size -- about 90 pixels on a 2K image -- and the error compounded.
+// Four clicks put the subject off the pane entirely, which is how this was
+// noticed at all: a screenshot of a zoomed comparison came back showing a
+// corner of the grass.
+void test_zooming_keeps_the_point_under_the_cursor() {
+    // A pane the shape of the real one, and an image larger than it.
+    const float origin_x = 518.f, avail_x = 1402.f, image_w = 2048.f;
+    const float fit = avail_x / image_w;
+
+    float pan = 0.f;
+    float scale = fit;
+    const float cursor = 1256.f;
+    // The image coordinate the cursor started on. It must still be there
+    // after any number of clicks, in or out.
+    const float at_start = (cursor - pan - centred_base(origin_x, avail_x, image_w, scale)) / scale;
+
+    for (int click = 0; click < 12; ++click) {
+        const float next = scale * (click < 8 ? 1.25f : 0.8f);
+        pan = pan_for_zoom(cursor, pan, origin_x, avail_x, image_w, scale, next);
+        scale = next;
+        const float on_screen =
+            screen_position(at_start, pan, origin_x, avail_x, image_w, scale);
+        if (std::fabs(on_screen - cursor) > 0.01f) {
+            char buf[200];
+            std::snprintf(buf, sizeof(buf),
+                          "after %d wheel clicks the point under the cursor has moved %.1f "
+                          "pixels (scale %.2f)",
+                          click + 1, on_screen - cursor, scale);
+            fail(buf);
+            return;
+        }
+    }
+    // And zooming about a point away from the centre must not be a no-op on
+    // the pan, or the test above would pass on arithmetic that ignores the
+    // cursor entirely and just recentres.
+    CHECK(std::fabs(pan) > 1.f);
+    std::puts("  12 wheel clicks: the point under the cursor stayed within 0.01 px");
+}
+
 // ---------------------------------------------------- remembered settings
 //
 // The application used to remember nothing, so every launch reset the preset,
@@ -1595,6 +1639,7 @@ int main() {
     test_changing_the_settings_and_running_again_uses_the_new_ones();
     test_a_whole_batch_can_be_run_again_at_a_new_preset();
     test_the_offered_next_time_limit_escalates_then_gives_up_limiting();
+    test_zooming_keeps_the_point_under_the_cursor();
     test_an_unlimited_run_is_never_reported_as_cut_short();
     test_settings_survive_a_round_trip();
     test_the_window_can_ask_for_everything_the_tool_can();

@@ -50,17 +50,17 @@ divider, and updates while optimization is running.
 
 Settings, window size and view preferences are remembered between launches.
 
-### Changing your mind
+### Adjusting and re-running
 
 Nothing has to be added twice. Change the preset, the precision or the time
 limit and press **Run again** on the item in the preview (or `Ctrl+R`, or
-right-click it in the queue) — the entry runs again in place with the settings
+right-click it in the queue). The entry runs again in place with the settings
 as they are now, and overwrites its own output. **Run All Again** does the same
 for everything finished, which is what a whole folder compressed at the wrong
 preset needs.
 
-When the time limit is what stopped a run, the preview says so — *"Stopped at
-872 of 3000 steps to stay inside the 3 s limit"* — and offers the fix next to
+When the time limit is what stopped a run, the preview says so (e.g. *"Stopped at
+872 of 3000 steps to stay inside the 3 s limit"*) and offers the fix next to
 it: one button that raises the limit and runs the image again. It doubles each
 time it is pressed, and once that would leave the top of the slider it offers
 no limit at all.
@@ -106,7 +106,7 @@ reachable from the desktop app.
 ## The wait is bounded
 
 Per-step cost scales with pixel count, so a step count that feels fine on one
-machine is a multi-minute wait on a slower one with a bigger image — and a
+machine is a multi-minute wait on a slower one with a bigger image, and a
 person watching a progress bar for five minutes reasonably concludes the
 feature does not work.
 
@@ -173,7 +173,7 @@ or open **Help ▸ Diagnostics** in the desktop app and press **Copy report**.
 
 It reports the CPU kernels selected, thread count, whether the GPU passed its
 self-check (and why not, if it did not), and what an encode actually costs on
-that hardware. Paste all of it into the report — those facts vary per machine
+that hardware. Paste all of it into the report as those facts vary per machine
 and none of them are visible from the outside.
 
 ---

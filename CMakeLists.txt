@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(gsic VERSION 1.0.1 LANGUAGES C CXX)
+project(gsic VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -147,6 +147,10 @@ if(WIN32)
   target_link_libraries(gsic-gui PRIVATE shell32)
 endif()
 target_link_libraries(gsic-gui PRIVATE gsic_app_core imgui::imgui glfw glad::glad nfd::nfd)
+# So the About box, the diagnostics report and the log line all say the version
+# this was actually built as. Without it the window falls back to a literal in
+# app.cpp, which is one more place to forget on a release.
+target_compile_definitions(gsic-gui PRIVATE GSIC_VERSION="${PROJECT_VERSION}")
 
 # ------------------------------------------------------------------ logo tool
 # Regenerates the icon and Store assets from fixed constants. Not built by

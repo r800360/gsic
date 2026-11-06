@@ -9,6 +9,7 @@
 
 #include "pipeline.h"
 #include "settings.h"
+#include "view.h"
 
 #include "core/codec.h"
 #include "core/format.h"
@@ -62,7 +63,7 @@ namespace gsic {
 namespace {
 
 #ifndef GSIC_VERSION
-#define GSIC_VERSION "1.0.1"
+#define GSIC_VERSION "1.1.0"
 #endif
 
 const nfdu8filteritem_t kImageFilter[] = {{"Images", "png,jpg,jpeg,jpe,jfif,bmp,tga,gif,hdr"}};
@@ -1206,12 +1207,13 @@ void App::draw_preview() {
         const float old_scale = scale;
         float target = old_scale * (ImGui::GetIO().MouseWheel > 0 ? 1.25f : 0.8f);
         target = std::clamp(target, fit * 0.25f, 32.f);
-        // Keep the pixel under the cursor fixed while zooming.
+        // Keep the pixel under the cursor fixed while zooming. See view.h:
+        // doing this by hand here is what got it wrong.
         const ImVec2 mouse = ImGui::GetIO().MousePos;
-        pan_.x = mouse.x - (mouse.x - pan_.x - (origin.x + (avail.x - view_w * target) * 0.5f)) *
-                     (target / old_scale) - (origin.x + (avail.x - view_w * target) * 0.5f);
-        pan_.y = mouse.y - (mouse.y - pan_.y - (origin.y + (avail.y - view_h * target) * 0.5f)) *
-                     (target / old_scale) - (origin.y + (avail.y - view_h * target) * 0.5f);
+        pan_.x = pan_for_zoom(mouse.x, pan_.x, origin.x, avail.x, float(view_w), old_scale,
+                              target);
+        pan_.y = pan_for_zoom(mouse.y, pan_.y, origin.y, avail.y, float(view_h), old_scale,
+                              target);
         zoom_ = target;
     }
     if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) reset_view();
@@ -1779,8 +1781,13 @@ int App::run(const std::vector<fs::path>& initial_files, const AppOptions& optio
     // that behaves differently depending on what is on the machine running it
     // is not testing or capturing what it claims to.
     const bool scripted = options.selftest || !options.screenshot.empty();
-    settings_file_ = settings_file_path();
-    if (!scripted && !settings_file_.empty()) load_settings(settings_, settings_file_);
+    settings_file_ =
+        options.settings_file.empty() ? settings_file_path() : options.settings_file;
+    // A file named on the command line is read even in the scripted modes.
+    // Those modes ignore the per-user file to stay reproducible, and a file
+    // the caller pointed at is reproducible by construction.
+    if ((!scripted || !options.settings_file.empty()) && !settings_file_.empty())
+        load_settings(settings_, settings_file_);
     clamp_settings(settings_);
     std::snprintf(out_dir_, sizeof(out_dir_), "%s", settings_.encode.out_dir.c_str());
 
@@ -1815,15 +1822,24 @@ int App::run(const std::vector<fs::path>& initial_files, const AppOptions& optio
         glfwGetMonitorContentScale(mon, &scale, &sy);
     }
     if (borderless && mon) {
-        // Client area exactly fills the monitor, kept above the taskbar. The
-        // title bar is left in place but pushed off screen: GLFW window
-        // positions refer to the client area, so placing it at (0, 0) puts
-        // the decoration above the top edge. Dropping the decoration instead
-        // leaves the docking layout unable to build.
+        // Client area exactly fills the monitor, kept above the taskbar, with
+        // no decoration at all.
+        //
+        // Keeping the title bar and pushing it off the top edge was tried
+        // first and does not work: Windows will not give a decorated window a
+        // client area as tall as the screen, so the mode advertised as "the
+        // monitor's size" quietly produced 1920x1061 and every capture made
+        // from it was nineteen rows short. Forcing the size from outside, by
+        // rewriting the window style, is worse -- the window reaches exactly
+        // 1920x1080 and then stops presenting new frames, because an OpenGL
+        // window does not survive having its style replaced underneath it.
+        // Asking GLFW for an undecorated window in the first place is the
+        // only one of the three that gives the size and keeps rendering.
         const GLFWvidmode* mode = glfwGetVideoMode(mon);
         win_w = mode->width;
         win_h = mode->height;
         glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
+        glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
     } else if (!scripted && settings_.ui.window_w > 0 && settings_.ui.window_h > 0) {
         win_w = settings_.ui.window_w;
         win_h = settings_.ui.window_h;
@@ -1983,9 +1999,15 @@ int App::run(const std::vector<fs::path>& initial_files, const AppOptions& optio
         // the case where nothing was queued at all, and the idle run has to
         // last several frames because the frame in the back buffer was drawn
         // before this check: capturing the instant the worker finishes catches
-        // a picture of the queue still working.
+        // a picture of the queue still working. --screenshot-at overrides all
+        // of that with a wall clock, for the one picture that wants the queue
+        // caught in the middle.
         idle_frames_ = pipeline_.busy() ? 0 : idle_frames_ + 1;
-        if (!options.screenshot.empty() && frames >= 45 && idle_frames_ >= 4) {
+        const bool capture_now =
+            options.screenshot_at > 0.0
+                ? glfwGetTime() >= options.screenshot_at
+                : (frames >= 45 && idle_frames_ >= 4);
+        if (!options.screenshot.empty() && capture_now) {
             const bool ok = capture_framebuffer(window_, options.screenshot);
             std::fprintf(stderr, "screenshot: %s %s\n", ok ? "wrote" : "could not write",
                          options.screenshot.string().c_str());
